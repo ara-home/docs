@@ -1,0 +1,206 @@
+---
+title: "Troubleshooting SCAL-P: errors, warnings, and fixes"
+description: "Diagnose and fix the most common SCAL-P problems: missing policies, trust score violations, hash mismatches, network failures, and CI exit codes."
+---
+
+Most SCAL-P problems fall into one of four categories: a missing or misconfigured policy, a trust score or hash failure, a network or cache issue, or a package manager not being found. The sections below describe each problem, explain what causes it, and tell you how to fix it.
+
+<AccordionGroup>
+
+  <Accordion title='"policy not found; allowing with audit"'>
+    **What it means:** SCAL-P looked for `.scalp/policy.json` (or the path passed with `--policy`) and did not find the file. It logs a `policy_missing` audit event with `status: "warn"` and continues in audit-only, non-blocking mode — nothing is blocked.
+
+    **When it appears:** Any command that loads a policy (`install`, `audit`, `ci`, `policy check`, `verify`) before `.scalp/policy.json` exists.
+
+    **How to fix it:** Create a minimal policy file:
+
+    ```json
+    {
+      "$schema": "https://raw.githubusercontent.com/CarlosEduJs/SCAL-P/main/.scalp/policy.schema.json",
+      "version": 1,
+      "trust": {
+        "mode": "audit-only"
+      },
+      "enforcement": {
+        "on_violation": "warn",
+        "default_mode": "passthrough"
+      }
+    }
+    ```
+
+    Save it as `.scalp/policy.json` in your project root. SCAL-P will pick it up on the next run without any flags. Commit `policy.json` and `policy.schema.json` to version control — they are the only `.scalp/` files that should be committed.
+  </Accordion>
+
+  <Accordion title='"trust_score: 17/50 (hash:0, maturity:0, dl:10, cves:7)"'>
+    **What it means:** A package scored below `trust.min_score`. The breakdown in parentheses shows exactly why:
+
+    | Component | Shown value | Meaning |
+    |---|---|---|
+    | `hash` | `0` | No lockfile entry — package was not installed through SCAL-P's guarded flow. |
+    | `maturity` | `0` | Package version is below `1.0.0`. |
+    | `dl` | `10` | Downloads unknown (offline or first run with no cache) — half points awarded. |
+    | `cves` | `7` | CVE status unknown (pre-install or no audit data) — half points awarded. |
+
+    **Maximum possible score:** 80 (hash 30 + maturity 15 + downloads 20 + cves 15).
+
+    **Half points:** `dl:10` means the download count could not be fetched (offline, network timeout, or no cached data). `cves:7` means `npm audit` could not run or had no data for this package. These are "unknown" — not "bad". A package with no internet access scores 17 for those two factors alone.
+
+    **How to fix it:**
+    - Run `scalp install --guarded` to populate the lockfile and give the package its `hash` points.
+    - Go online so SCAL-P can fetch download counts and run `npm audit`.
+    - If the score is genuinely too low, lower `trust.min_score` or explicitly allow the package in `packages.allow`.
+    - If the package is pre-release (below `1.0.0`) and you trust it, add it to `packages.allow` with a `versions` constraint.
+  </Accordion>
+
+  <Accordion title='"hash_required: package integrity not in lockfile"'>
+    **What it means:** `trust.require_hash` is `true` in your policy and the package has no entry in `.scalp/lockfile.json`. This is a hard violation regardless of the total trust score.
+
+    **What triggers it:** Any package that was installed without going through `scalp install --guarded` or `scalp ci`. If you ran `npm install` or `pnpm install` directly, SCAL-P never hashed those packages, so they have no lockfile entry.
+
+    **How to fix it:**
+
+    ```bash
+    scalp install --guarded
+    ```
+
+    This resolves the lockfile, evaluates policy, installs packages, and runs `SyncWithTree` to hash every package directory. After this run, every installed package will have a lockfile entry and `require_hash` will no longer flag them.
+
+    <Warning>
+      If you see `hash_required` in CI on a fresh checkout, it means the `.scalp/lockfile.json` was not committed or was deleted. Either commit the lockfile (not recommended — it is local state) or run `scalp ci` as part of your CI setup step so it generates the lockfile before the audit step.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="Offline or network failures: half points and stale cache">
+    **What happens:** SCAL-P fetches weekly download counts from `api.npmjs.org` and runs `npm audit --json` to check CVEs. Both have a 10-second timeout. If either call fails, SCAL-P does not abort — it uses half points instead of zero for the affected factor.
+
+    | Situation | Downloads points | CVE points |
+    |---|---|---|
+    | Online, data available | 0–20 (based on count) | 0 or 15 |
+    | Offline, no cache | 10 | 7 |
+    | Offline, stale cache | uses cached value | uses cached value |
+
+    **Stale cache:** Download counts and CVE data are cached in `.scalp/cache/trust.json` for 7 days per package. If your machine is offline but the cache has data from a previous run, SCAL-P uses the cached values rather than half points.
+
+    **How to clear the cache:**
+
+    ```bash
+    rm .scalp/cache/trust.json
+    ```
+
+    The cache is rebuilt automatically on the next online run. You do not need to clear it unless you suspect stale CVE data is hiding a real vulnerability.
+
+    <Note>
+      The cache file `.scalp/cache/trust.json` should not be committed to version control. It is machine-local and auto-managed.
+    </Note>
+  </Accordion>
+
+  <Accordion title='"hash_mismatch" in audit output'>
+    **What it means:** SCAL-P recomputed the SHA-512 hash of a package directory and it does not match the value stored in `.scalp/lockfile.json`. This means the package contents changed after the lockfile was last generated.
+
+    **Common causes:**
+    - A post-install script modified a file in `node_modules` after SCAL-P hashed it.
+    - `npm install` or `pnpm install` was run directly, updating a package without going through SCAL-P.
+    - The package was manually edited (intentionally or by an attacker).
+    - The lockfile was generated on a different OS or Node.js version where the package resolved differently.
+
+    **How to investigate:**
+
+    ```bash
+    # Re-sync the lockfile to see what changed
+    scalp install --guarded
+    # Then audit to confirm the mismatch is gone
+    scalp audit
+    ```
+
+    <Warning>
+      A `hash_mismatch` in CI — where no human has touched `node_modules` — is a supply chain signal worth investigating. Check whether the package itself was updated in the registry, whether a post-install script ran, or whether the dependency was changed between lockfile generation and install.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="Exit code 1 from scalp ci: reading the report">
+    **What it means:** `scalp ci` always blocks on violations (`on_violation: "block"` is forced). Exit code 1 means at least one violation was found — either a policy violation before install or a hash mismatch after install.
+
+    SCAL-P writes a JSON report to `.scalp/ci-report.json` (or the path set by `--output`) even when it exits 1. The report is always written so CI can collect it as an artifact.
+
+    **Reading the report:**
+
+    ```json
+    {
+      "version": "0.2",
+      "passed": false,
+      "violations": [
+        {
+          "package": "some-pkg@0.1.0",
+          "reason": "trust_score_too_low",
+          "rule": "trust"
+        }
+      ],
+      "audit": {
+        "verified": 42,
+        "mismatched": 1,
+        "missing": 0
+      }
+    }
+    ```
+
+    - `violations` lists every pre-install policy or trust violation that caused the exit 1.
+    - `audit.mismatched` counts packages whose on-disk hash did not match the lockfile.
+    - `audit.missing` counts packages in the lockfile with no corresponding directory.
+
+    **How to fix it:** Read the `reason` field in each violation. Common values and fixes:
+
+    | Reason | Fix |
+    |---|---|
+    | `trust_score_too_low` | Lower `min_score` or run `scalp install --guarded` online to populate hash and download data. |
+    | `hash_required` | Run `scalp install --guarded` to generate lockfile entries. |
+    | `hash_mismatch` | Re-sync with `scalp install --guarded` and investigate the changed package. |
+    | `denylist` | Remove the package or add an exception in policy. |
+    | `allowlist` | Add the package to `packages.allow`. |
+  </Accordion>
+
+  <Accordion title="Package manager not found">
+    **What it means:** SCAL-P could not find the package manager binary (`npm` or `pnpm`) in `PATH`.
+
+    **Error message format:**
+
+    ```
+    unsupported package manager: <name>
+    ```
+
+    or an exec error when SCAL-P tries to run the binary.
+
+    **How to fix it:**
+    - Confirm the package manager is installed: `npm --version` or `pnpm --version`.
+    - If you are using pnpm and passing `--pm npm` (the default), change to `--pm pnpm`.
+    - In CI, make sure the package manager is installed before running `scalp`. Example for GitHub Actions:
+
+    ```bash
+    npm install -g pnpm
+    scalp ci --pm pnpm
+    ```
+
+    SCAL-P currently supports `npm` and `pnpm`. Passing any other value to `--pm` returns an "unsupported package manager" error immediately.
+  </Accordion>
+
+  <Accordion title="Cache staleness: clearing trust.json">
+    **What it means:** The trust cache at `.scalp/cache/trust.json` stores download counts and CVE results for up to 7 days per package. Stale entries can cause a previously-clean package to still show old CVE data, or prevent a newly-popular package from getting full download points.
+
+    **How to clear the cache:**
+
+    ```bash
+    rm .scalp/cache/trust.json
+    ```
+
+    SCAL-P rebuilds it automatically on the next online run. There is no partial-clear option; the entire file is regenerated.
+
+    **When to clear:**
+    - A CVE was patched and you want the scorer to re-evaluate.
+    - You suspect download count data is more than 7 days stale.
+    - You switched the package manager and old entries no longer apply.
+
+    <Tip>
+      In CI environments, you may want to delete `.scalp/cache/` on each run to ensure fresh data. This trades a small increase in network calls for deterministic scoring.
+    </Tip>
+  </Accordion>
+
+</AccordionGroup>

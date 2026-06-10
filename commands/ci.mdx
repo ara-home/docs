@@ -1,0 +1,188 @@
+---
+title: "scalp ci: Single-command supply chain security for CI"
+description: "Resolve, evaluate policy, block violations, install, hash-sync, and audit in one command. Produces a JSON report and always exits 1 on any violation."
+---
+
+`scalp ci` is the command designed for automated pipelines. It combines everything `scalp install --guarded` and `scalp audit` do into a single invocation that always blocks on violations and always produces a machine-readable JSON report. Where `scalp install --guarded` is tuned for iterative development — respecting your policy's enforcement setting and accepting passthrough args — `scalp ci` is built for a pipeline that needs a deterministic, script-friendly outcome: exit 0 or exit 1, with a structured report explaining why.
+
+## Synopsis
+
+```bash
+scalp ci [--pm npm|pnpm] [--policy <file>] [--pr-context fork|internal] [--output <file>] [--allow-scripts]
+```
+
+## Flags
+
+<ParamField path="--pm" type="string" default="npm">
+  Package manager to use for resolution, installation, and tree inspection. Accepted values: `npm`, `pnpm`.
+</ParamField>
+
+<ParamField path="--policy" type="string" default=".scalp/policy.json">
+  Path to the policy file. If absent, SCAL-P logs a warning and proceeds in audit-only mode without blocking.
+</ParamField>
+
+<ParamField path="--pr-context" type="string" default="fork">
+  PR origin context. Controls `require_hash` enforcement and install script behavior. Accepted values: `fork`, `internal`. See [PR context](#pr-context-fork-vs-internal) for details.
+</ParamField>
+
+<ParamField path="--output" type="string" default=".scalp/ci-report.json">
+  Path to write the JSON report. Pass `-` to print the report to stdout instead of writing a file.
+</ParamField>
+
+<ParamField path="--allow-scripts" type="boolean" default="false">
+  Allow package lifecycle scripts (`preinstall`, `install`, `postinstall`) to run during install. Only meaningful with `--pr-context internal`. In fork context, scripts are always blocked regardless of this flag.
+</ParamField>
+
+## The 8-step pipeline
+
+Every `scalp ci` run executes the following steps in order, stopping and exiting 1 if a violation is found at step 4.
+
+<Steps>
+  <Step title="Load policy">
+    Reads `.scalp/policy.json` (or the path from `--policy`). If the file is missing, SCAL-P logs a warning and continues with default settings.
+  </Step>
+  <Step title="Resolve dependencies">
+    Runs the package manager's lockfile-only resolution step. No packages are installed yet; only the lockfile is updated.
+  </Step>
+  <Step title="Evaluate policy and trust scores">
+    Parses the resolved lockfile and evaluates every package against your allow/deny rules, minimum trust score, and `require_hash` setting. Trust scores are computed from the cache and npm registry metadata.
+  </Step>
+  <Step title="Block on violations">
+    If any violation exists, SCAL-P writes the JSON report and exits 1 immediately. The install step is never reached. This is unconditional — `scalp ci` always uses `block` enforcement regardless of `on_violation` in your policy.
+  </Step>
+  <Step title="Install packages">
+    Runs the package manager's install command. Install scripts are suppressed with `--ignore-scripts` unless `--pr-context internal` and `--allow-scripts` are both set.
+  </Step>
+  <Step title="Hash sync">
+    Computes SHA-512 hashes for every installed package directory and saves them to `.scalp/lockfile.json`.
+  </Step>
+  <Step title="Verify hashes">
+    Compares the freshly computed hashes against the lockfile to detect any tampering or corruption that may have occurred during install.
+  </Step>
+  <Step title="Write report">
+    Writes the structured JSON report to `--output`. The `passed` field is `true` only when both policy evaluation and hash audit find zero issues.
+  </Step>
+</Steps>
+
+## PR context: fork vs internal
+
+The `--pr-context` flag tells `scalp ci` how much trust to extend to the incoming code.
+
+| Context | `require_hash` | Install scripts | Typical use case |
+|---------|----------------|-----------------|------------------|
+| `fork` (default) | Forced on | Always blocked | PRs from external contributors or untrusted forks |
+| `internal` | Respects policy | Blocked unless `--allow-scripts` | PRs from team members with write access |
+
+**Fork mode** overrides `trust.require_hash` to `true` regardless of what your policy says. Every package must have a lockfile integrity entry. An external contributor could have tampered with `package-lock.json` or removed hash entries, so this override is unconditional.
+
+**Internal mode** respects your policy's `require_hash` setting. Scripts are still blocked by default; you opt in explicitly with `--allow-scripts` when you have a known reason to need them.
+
+<Warning>
+  `--allow-scripts` has no effect when `--pr-context fork` is set. Scripts are unconditionally blocked in fork mode as a supply chain defense against malicious postinstall hooks.
+</Warning>
+
+## Install scripts
+
+npm and pnpm allow packages to run arbitrary code via lifecycle scripts during install. This is one of the most common supply chain attack vectors. `scalp ci` passes `--ignore-scripts` to the package manager by default. No `preinstall`, `install`, or `postinstall` scripts run. No postinstall hooks. No unexpected binaries.
+
+To allow scripts in an internal PR context:
+
+```bash
+scalp ci --pr-context internal --allow-scripts
+```
+
+## JSON report format
+
+The report is written to `.scalp/ci-report.json` (or the path from `--output`) after every run.
+
+```json
+{
+  "version": "0.2",
+  "passed": false,
+  "violations": [
+    {
+      "package": "evil@1.0",
+      "reason": "trust_score: 17/50 (hash:0, maturity:0, dl:10, cves:7)",
+      "rule": "min_score:50"
+    }
+  ],
+  "audit": {
+    "verified": 42,
+    "mismatched": 0,
+    "missing": 1
+  }
+}
+```
+
+The `audit` section counts three categories from the hash verification step:
+
+| Field | What it means |
+|-------|---------------|
+| `verified` | Packages whose on-disk hash matches the lockfile entry. |
+| `mismatched` | Packages whose on-disk hash differs from the lockfile (tampered or corrupted). |
+| `missing` | Packages in the dependency tree with no lockfile entry, or listed in the lockfile but absent from `node_modules`. |
+
+`passed` is `true` only when both the policy evaluation and the hash audit return zero violations.
+
+## Examples
+
+<Tabs>
+  <Tab title="GitHub Actions">
+    ```yaml
+    - name: Run SCAL-P security check
+      run: scalp ci --output ci-report.json
+
+    - name: Show report on failure
+      if: failure()
+      run: cat ci-report.json
+    ```
+  </Tab>
+  <Tab title="GitLab CI">
+    ```yaml
+    scalp-check:
+      script:
+        - scalp ci --output scalp-report.json
+      artifacts:
+        paths:
+          - scalp-report.json
+    ```
+  </Tab>
+  <Tab title="Local debugging">
+    ```bash
+    # Print report to stdout instead of a file
+    scalp ci --output -
+    ```
+  </Tab>
+</Tabs>
+
+```bash
+# Internal PR — allow scripts, respect policy trust settings
+scalp ci --pr-context internal --allow-scripts
+
+# Run with pnpm
+scalp ci --pm pnpm
+
+# Custom policy and output path
+scalp ci --policy .scalp/strict-policy.json --output reports/scalp.json
+```
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | All steps passed — policy, trust scores, and hash audit found no violations. |
+| `1` | One or more violations found, or a step (resolve, install, hash sync) returned an error. The JSON report contains details. |
+
+<Note>
+  `scalp ci` does not accept passthrough arguments to the underlying package manager. If you need to pass custom npm or pnpm flags, use `scalp install --guarded` instead.
+</Note>
+
+## Difference from `scalp install --guarded`
+
+| | `scalp install --guarded` | `scalp ci` |
+|--|--------------------------|------------|
+| Enforcement | Respects `on_violation` in policy | Always blocks |
+| Install scripts | Passed through to PM | Blocked by default |
+| Report | None | JSON report always written |
+| Passthrough PM args | Supported via `--` | Not supported |
+| Intended for | Development workflows | CI pipelines |

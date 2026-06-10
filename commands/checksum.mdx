@@ -1,0 +1,90 @@
+---
+title: "scalp checksum: Generate SHA-512 checksums for files"
+description: "Compute SHA-512 hashes for one or more files and write them in the standard two-field format compatible with scalp verify and other checksum tools."
+---
+
+`scalp checksum` is a standalone hashing utility. It reads each file you pass, computes a SHA-512 hash using the same engine SCAL-P uses for npm packages, and outputs one line per file in `<hash>  <filename>` format. There is no policy enforcement, no audit logging, and no network access — it is a pure hash tool. Its primary use is generating a checksums file for release artifacts so that `scalp verify` (or any compatible tool) can confirm integrity after download.
+
+## Synopsis
+
+```bash
+scalp checksum [--output <file>] <files...>
+```
+
+At least one file argument is required.
+
+## Flags
+
+<ParamField path="--output" type="string">
+  Write the checksums to a file instead of stdout. If omitted, output goes to stdout and can be piped or redirected normally. The file is written with `0644` permissions.
+</ParamField>
+
+## Output format
+
+Each line of output contains exactly two fields separated by two spaces:
+
+```text
+<sha512-hash>  <filename>
+```
+
+The hash field uses the `sha512-` prefix followed by the base64-encoded SHA-512 digest — the same format used in npm's `integrity` field and in SCAL-P's `.scalp/lockfile.json`. Only the base filename is used in the output, not the full path.
+
+**Example output:**
+
+```text
+sha512-a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6a7b8c9d0e1f2  scalp_linux_amd64.tar.gz
+sha512-e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6a7b8c9d0e1f2g3h4i5j6  scalp_darwin_amd64.tar.gz
+```
+
+## Examples
+
+```bash
+# Hash a single file and print to stdout
+scalp checksum scalp_linux_amd64.tar.gz
+```
+
+```bash
+# Hash multiple files and redirect to a checksums file
+scalp checksum scalp_linux_amd64.tar.gz scalp_darwin_amd64.tar.gz > checksums.txt
+```
+
+```bash
+# Hash all .tar.gz files and write to a file with --output
+scalp checksum --output checksums.txt scalp_linux_amd64.tar.gz scalp_darwin_amd64.tar.gz
+```
+
+```bash
+# Hash all release artifacts using a glob (shell expands the glob)
+scalp checksum scalp_*.tar.gz > checksums.txt
+```
+
+### Full release workflow
+
+The typical pattern is to generate checksums during the release build and upload them alongside the artifacts, so users can verify their downloads with `scalp verify`:
+
+```bash
+# During release: generate and upload
+scalp checksum scalp_linux_amd64.tar.gz scalp_darwin_amd64.tar.gz > checksums.txt
+gh release create v0.2.0 scalp_linux_amd64.tar.gz scalp_darwin_amd64.tar.gz checksums.txt
+
+# After download: verify
+scalp verify --artifact scalp_linux_amd64.tar.gz --checksum checksums.txt --ci
+```
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | All files hashed successfully. |
+| `1` | A file could not be read or hashed, or no file arguments were provided. |
+
+## What it does not do
+
+- Does not sign the checksums file. If you need cryptographic attestation, sign the checksums file separately with GPG or cosign.
+- Does not access the network.
+- Does not write to `.scalp/audit.log`.
+- Does not enforce any policy.
+
+<Note>
+  The `--output` flag and stdout redirection produce identical content. Use `--output` when you want SCAL-P to manage the file write; use stdout redirection when you need to pipe the output through other tools first.
+</Note>

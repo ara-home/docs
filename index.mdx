@@ -1,0 +1,74 @@
+---
+title: "SCAL-P: Secure Chain Assurance Layer for Packages (v0.2)"
+description: "SCAL-P wraps npm and pnpm to enforce dependency policies, verify integrity via SHA-512 hashing, and log every install as a security checkpoint."
+---
+
+SCAL-P is a Go CLI tool that acts as a security layer between your JavaScript project and the npm ecosystem. It wraps your package manager to enforce dependency policies before install, hash every installed package for integrity verification, and produce a structured audit trail of every operation. With zero external Go dependencies and an offline-first design, SCAL-P fits into any development workflow or CI pipeline.
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Download the binary or build from source. Get SCAL-P running in under a minute.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run your first guarded install and see policy enforcement in action.
+  </Card>
+  <Card title="Command reference" icon="terminal" href="/commands/install">
+    Every command, flag, and default value documented with real examples.
+  </Card>
+  <Card title="Policy configuration" icon="shield-check" href="/configuration/policy">
+    Configure allowlists, denylists, trust scores, and enforcement modes.
+  </Card>
+</CardGroup>
+
+## What SCAL-P does
+
+npm and pnpm run arbitrary code during install via lifecycle scripts. SCAL-P flips the order: **policy before trust, hash after install, audit always.**
+
+<Steps>
+  <Step title="Resolve dependencies">
+    SCAL-P resolves your lockfile without installing, so it can evaluate every package before any code runs.
+  </Step>
+  <Step title="Evaluate policy and trust scores">
+    Every dependency is checked against your `.scalp/policy.json` — allow/deny rules, minimum trust score, and hash requirements.
+  </Step>
+  <Step title="Install with hash verification">
+    If all packages pass, SCAL-P installs and then computes SHA-512 hashes of every package directory, saving them to `.scalp/lockfile.json`.
+  </Step>
+  <Step title="Audit and report">
+    Hash verification confirms `node_modules` matches the lockfile. A structured JSON report is written for CI consumption.
+  </Step>
+</Steps>
+
+## Key capabilities
+
+<CardGroup cols={2}>
+  <Card title="Trust scoring" icon="star" href="/configuration/trust-score">
+    Packages are scored 0–80 based on hash verification, version maturity, download popularity, and CVE status. Set a minimum score in policy.
+  </Card>
+  <Card title="CI mode" icon="circle-check" href="/commands/ci">
+    `scalp ci` resolves, evaluates, installs, audits, and writes a JSON report in one command — always exits 1 on violations.
+  </Card>
+  <Card title="Binary verification" icon="lock" href="/guides/binary-verify">
+    `scalp verify` checks SCAL-P's own release binaries using the same SHA-512 engine — complete supply chain integrity.
+  </Card>
+  <Card title="Audit log" icon="scroll" href="/reference/audit-log">
+    Every install, audit, and verify produces NDJSON events appended to `.scalp/audit.log` for complete traceability.
+  </Card>
+</CardGroup>
+
+## One command for CI
+
+The fastest way to add supply chain security to a CI pipeline:
+
+```bash
+scalp ci --pr-context fork --output ci-report.json
+```
+
+- Blocks on any policy violation — exit code 1
+- Forces `require_hash` in fork PRs to prevent lockfile tampering
+- Passes `--ignore-scripts` to your package manager — no postinstall code
+- Writes a machine-readable JSON report
+
+<Tip>
+  No policy file? SCAL-P defaults to audit-only mode — it hashes and logs everything without blocking. Add `.scalp/policy.json` when you're ready to enforce.
+</Tip>

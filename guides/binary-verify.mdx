@@ -1,0 +1,179 @@
+---
+title: "Verifying SCAL-P release binaries with scalp verify"
+description: "Use scalp checksum and scalp verify to generate and validate SHA-512 hashes for SCAL-P releases, closing the trust loop with the same engine."
+---
+
+SCAL-P spends its runtime verifying npm and pnpm packages before they are installed. Binary verification closes the loop: the same SHA-512 hashing engine and audit infrastructure that protects your dependencies also protects the SCAL-P binary itself. If you cannot verify the tool that does the verifying, you have a trust problem. This guide covers how release authors generate checksums and how users verify downloads before running them.
+
+## Why binary verification matters
+
+SCAL-P's value proposition is "verify before trust." Distributing a binary without a verification path would undermine that claim entirely. The `scalp checksum` and `scalp verify` commands use the same hash format (`sha512-<base64>`), the same audit log (`.scalp/audit.log`), and the same policy enforcement model as every other SCAL-P command — no special cases for SCAL-P itself.
+
+<Note>
+  Binary verification does not replace transport security or GPG signing. Download the binary and checksums file over HTTPS. Consider GPG-signing the checksums file as an additional layer. See [limitations](#limitations) for what this feature does not cover.
+</Note>
+
+## Commands
+
+Two commands form the release verification chain:
+
+**`scalp checksum`** — run by the release author to generate a checksums file:
+
+```
+scalp checksum [--output <file>] <files...>
+```
+
+- Reads each file, computes its SHA-512, and writes one line per file
+- `--output` writes to a file; without it, output goes to stdout
+- No policy, no audit, no enforcement — it is a pure hash utility
+
+**`scalp verify`** — run by the user after downloading a release artifact:
+
+```
+scalp verify --artifact <file> --checksum <file> [--policy <file>] [--ci]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--artifact` | required | Path to the downloaded release artifact |
+| `--checksum` | required | Path to the checksums file |
+| `--policy` | `.scalp/policy.json` | Policy file controlling enforcement behavior |
+| `--ci` | false | Override enforcement to `block` regardless of policy |
+
+## Verification flow
+
+<Steps>
+  <Step title="Release author: build and package artifacts">
+    Build your release binaries. For SCAL-P itself, GoReleaser produces `.tar.gz` and `.zip` archives for each target platform.
+  </Step>
+
+  <Step title="Release author: generate checksums">
+    Run `scalp checksum` against all release artifacts. The output is a plain-text file with one `sha512-<hash>  <filename>` line per artifact:
+
+    ```bash
+    scalp checksum scalp_linux_amd64.tar.gz scalp_darwin_amd64.tar.gz > checksums.txt
+    ```
+
+    Output format:
+
+    ```
+    sha512-a1b2c3d4...  scalp_linux_amd64.tar.gz
+    sha512-e5f6g7h8...  scalp_darwin_amd64.tar.gz
+    ```
+  </Step>
+
+  <Step title="Release author: upload artifacts and checksums">
+    Upload the binaries and the `checksums.txt` file together. Users must be able to download both. The checksums file is useless without the artifact and vice versa.
+  </Step>
+
+  <Step title="User: download artifact and checksums">
+    Download the release artifact for your platform and the `checksums.txt` file from the same release. Use HTTPS.
+  </Step>
+
+  <Step title="User: run scalp verify">
+    Run `scalp verify` with both files. Pass `--ci` to force blocking enforcement regardless of local policy:
+
+    ```bash
+    scalp verify \
+      --artifact scalp_linux_amd64.tar.gz \
+      --checksum checksums.txt \
+      --ci
+    ```
+
+    `scalp verify` loads the policy (or defaults), parses the checksums file, looks up the artifact filename, computes its SHA-512, compares against the stored hash, logs an audit event, and enforces the result.
+  </Step>
+
+  <Step title="Check the audit log">
+    Every `scalp verify` invocation appends one event to `.scalp/audit.log`. Inspect it to confirm the verification ran and what the outcome was:
+
+    ```json
+    {"ts":"2026-05-13T12:00:00Z","event":"binary_verify","pkg":"scalp_linux_amd64.tar.gz","status":"verified","hash_match":true}
+    ```
+
+    `status` is `"verified"` on a match and `"mismatch"` on failure.
+  </Step>
+</Steps>
+
+## Release pipeline and user verification examples
+
+<CodeGroup>
+
+```yaml release pipeline (GitHub Actions)
+# Generate checksums during release
+- name: Generate checksums with scalp
+  run: |
+    /tmp/scalp-bootstrap checksum dist/*.tar.gz dist/*.zip > dist/checksums.txt
+
+# Verify all artifacts with scalp (dogfooding)
+- name: Verify all artifacts with scalp
+  run: |
+    for f in dist/*.tar.gz dist/*.zip; do
+      echo "Verifying $(basename $f)..."
+      /tmp/scalp-bootstrap verify --artifact "$f" --checksum dist/checksums.txt --ci
+    done
+
+# Upload artifacts and checksums to the release
+- name: Upload scalp checksums to release
+  run: gh release upload "${{ github.ref_name }}" dist/checksums.txt --clobber
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+```bash user verification
+# After downloading the artifact and checksums.txt:
+scalp verify \
+  --artifact scalp_linux_amd64.tar.gz \
+  --checksum checksums.txt \
+  --ci
+```
+
+</CodeGroup>
+
+## Enforcement behavior
+
+Without `--ci`, enforcement is controlled by your `.scalp/policy.json`. The default enforcement level when no policy is present is `warn`.
+
+| Enforcement | Hash match | Hash mismatch |
+|---|---|---|
+| `warn` (default) | exit 0 | Logged, exit 0 |
+| `block` | exit 0 | exit 1 |
+| `log` | exit 0 | Silent, exit 0 |
+
+With `--ci`, enforcement is forced to `block` regardless of the policy file. Use `--ci` in automated pipelines where a mismatch must halt execution.
+
+<Warning>
+  The default enforcement of `warn` means a hash mismatch will be logged but will not stop execution unless you pass `--ci` or configure `block` in your policy. Always use `--ci` in release validation pipelines.
+</Warning>
+
+## Audit event
+
+Every `scalp verify` call produces exactly one audit event appended to `.scalp/audit.log`:
+
+```json
+{"ts":"2026-05-13T12:00:00Z","event":"binary_verify","pkg":"scalp_linux_amd64.tar.gz","status":"verified","hash_match":true}
+```
+
+| Field | Values | Description |
+|---|---|---|
+| `event` | `"binary_verify"` | Event type |
+| `pkg` | filename | The artifact that was verified |
+| `status` | `"verified"` / `"mismatch"` | Outcome of the hash comparison |
+| `hash_match` | `true` / `false` | Whether the computed hash matched the checksums file |
+
+The event appears in the same log as all other SCAL-P events (`install`, `audit`, `policy_violation`). There are no special-case log files for binary verification.
+
+## Limitations
+
+Binary verification with `scalp verify` does the following and nothing more:
+
+- Computes SHA-512 of the artifact
+- Compares against the stored hash in the checksums file
+- Logs the result to `.scalp/audit.log`
+- Enforces based on policy or `--ci`
+
+It does **not**:
+
+- GPG-sign or verify the checksums file — do that separately with your signing key
+- Verify the checksums file's own authenticity — HTTPS delivery and GPG signing are your responsibility
+- Scan the binary for malware — that is your OS vendor's domain
+- Accept wildcards in `--artifact` — verify one file at a time

@@ -1,0 +1,290 @@
+---
+title: "Package managers: configure npm and pnpm in SCAL-P"
+description: "Configure SCAL-P to use npm or pnpm, understand the --pm flag and its ordering rules, and learn how the adapter interface works for both managers."
+---
+
+SCAL-P supports npm and pnpm through an adapter interface that abstracts every package manager operation behind a common API. Both adapters implement the same `PackageManager` interface in `internal/pkgmanager/pkgmanager.go`, so every SCAL-P command — install, audit, CI, policy check — works identically regardless of which manager you use.
+
+npm is the default. Switch to pnpm with the `--pm` flag.
+
+---
+
+## Selecting a package manager
+
+Use the `--pm` flag to choose between `npm` and `pnpm`. The flag applies to the current invocation only; it does not change the project default.
+
+<Note>
+`--pm` is a per-subcommand flag. It can appear in any order relative to other named flags, but must come before any positional arguments (i.e., before the `--` separator used to pass extra arguments to the package manager). For clarity, the convention used throughout the docs is to write `--pm` first.
+
+```bash
+# Both of these work correctly
+scalp install --pm pnpm --guarded
+scalp install --guarded --pm pnpm
+```
+</Note>
+
+---
+
+## Command examples
+
+<Tabs>
+  <Tab title="npm">
+    npm is the default package manager. You do not need to pass `--pm npm` unless you want to be explicit.
+
+    ```bash
+    # Guarded install (resolve → evaluate → block → install → hash-sync)
+    scalp install --guarded
+
+    # Explicit npm
+    scalp install --pm npm --guarded
+
+    # Passthrough install (install → hash-sync, no policy evaluation)
+    scalp install --pm npm
+
+    # Verify lockfile hashes match node_modules
+    scalp audit --pm npm
+
+    # Full CI pipeline
+    scalp ci --pm npm
+
+    # Evaluate policy without installing
+    scalp policy check --pm npm
+    ```
+
+    npm resolves dependencies by running `npm install --package-lock-only --ignore-scripts` and reads `package-lock.json` (v2 or v3 format) for its lockfile. The dependency tree is produced with `npm ls --all --json`.
+  </Tab>
+  <Tab title="pnpm">
+    Pass `--pm pnpm` on any command to use pnpm instead.
+
+    ```bash
+    # Guarded install with pnpm
+    scalp install --pm pnpm --guarded
+
+    # Passthrough install with pnpm
+    scalp install --pm pnpm
+
+    # Verify lockfile hashes match node_modules
+    scalp audit --pm pnpm
+
+    # Full CI pipeline with pnpm
+    scalp ci --pm pnpm
+
+    # Evaluate policy without installing
+    scalp policy check --pm pnpm
+    ```
+
+    pnpm resolves dependencies by running `pnpm install --lockfile-only` and reads `pnpm-lock.yaml` directly for its lockfile. The dependency tree is built by parsing `pnpm-lock.yaml` (fast path) with a fallback to `pnpm ls --json --depth Infinity` if lockfile parsing fails.
+  </Tab>
+</Tabs>
+
+---
+
+## Lockfile formats
+
+Each adapter reads a different lockfile format. SCAL-P parses both into a common `[]PackageNode` flat list used by policy evaluation and hash verification.
+
+| Package manager | Lockfile | Required version |
+|----------------|----------|-----------------|
+| npm | `package-lock.json` | v2 or v3 |
+| pnpm | `pnpm-lock.yaml` | v5.4 through v9+ |
+
+<Tabs>
+  <Tab title="npm lockfile">
+    npm's `package-lock.json` uses a `packages` map keyed by install path (e.g., `node_modules/lodash`). SCAL-P reads the `version`, `resolved`, and `integrity` fields from each entry and derives the depth from the nesting of `node_modules` segments in the key.
+
+    ```json package-lock.json (excerpt)
+    {
+      "lockfileVersion": 3,
+      "packages": {
+        "node_modules/lodash": {
+          "version": "4.17.21",
+          "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+          "integrity": "sha512-v2kDEe57lecTulaDIuNTPy3Ry4d..."
+        }
+      }
+    }
+    ```
+
+    Lockfile v1 is not supported. Run `npm install` with a modern npm to upgrade to v2 or v3.
+  </Tab>
+  <Tab title="pnpm lockfile">
+    pnpm's `pnpm-lock.yaml` uses a `packages` section with entries keyed by `/name/version` or `/name@version`. SCAL-P uses a custom line-by-line parser (not a full YAML parser) to extract `name`, `version`, `integrity`, and `resolved` for each entry.
+
+    ```yaml pnpm-lock.yaml (excerpt)
+    packages:
+
+      /lodash/4.17.21:
+        resolution:
+          integrity: sha512-v2kDEe57lecTulaDIuNTPy3Ry4d...
+        dev: false
+    ```
+
+    The parser supports scoped packages (`/@babel/code-frame/7.24.7`), percent-encoded scopes (`/@scope%2Fname/1.0.0`), and both `/name/version` and `/name@version` key formats. Peer dependencies, optional dependencies, patches, and overrides are not parsed.
+  </Tab>
+</Tabs>
+
+---
+
+## Adapter interface
+
+Both adapters implement the `PackageManager` interface defined in `internal/pkgmanager/pkgmanager.go`. The interface is the single contract between SCAL-P's command layer and any package manager backend.
+
+```go internal/pkgmanager/pkgmanager.go
+type PackageManager interface {
+    // Name returns the package manager identifier ("npm" or "pnpm").
+    Name() string
+
+    // Resolve resolves dependencies without installing (lockfile-only).
+    Resolve(ctx context.Context, args ...string) error
+
+    // GetTree returns the full dependency tree.
+    GetTree(ctx context.Context) (DependencyTree, error)
+
+    // Install runs the package manager's install command.
+    Install(ctx context.Context, args ...string) error
+
+    // ParseLockfile reads the PM-specific lockfile and returns a flat node list.
+    ParseLockfile(ctx context.Context) ([]PackageNode, error)
+
+    // LocalPath returns the node_modules path for a package by name.
+    LocalPath(name string) string
+}
+```
+
+Each method maps to a specific lifecycle stage:
+
+| Method | When it is called | npm implementation | pnpm implementation |
+|--------|------------------|-------------------|---------------------|
+| `Name` | Logging and error messages | Returns `"npm"` | Returns `"pnpm"` |
+| `Resolve` | Before policy evaluation — generates lockfile without installing | `npm install --package-lock-only --ignore-scripts` | `pnpm install --lockfile-only` |
+| `GetTree` | Dependency tree construction for trust scoring | `npm ls --all --json` | Parse `pnpm-lock.yaml` (fallback: `pnpm ls --json --depth Infinity`) |
+| `Install` | After policy passes, runs actual install | `npm install [args]` | `pnpm install [args]` |
+| `ParseLockfile` | Hash sync and flat node list for policy evaluation | Reads `package-lock.json` | Reads `pnpm-lock.yaml` |
+| `LocalPath` | Resolves on-disk path for a package name | `node_modules/<name>` | `node_modules/<name>` |
+
+---
+
+## Registry and adapter registration
+
+SCAL-P uses a thread-safe registry in `internal/pkgmanager/registry.go` to map adapter names to constructor functions.
+
+```go internal/pkgmanager/registry.go
+// Register adds a package manager constructor to the registry.
+func Register(name string, fn NewFunc) { ... }
+
+// Get returns the PackageManager for the given name.
+func Get(name string) (PackageManager, error) { ... }
+
+// Registered returns the names of all registered package managers.
+func Registered() []string { ... }
+```
+
+Each adapter registers itself by calling `pkgmanager.Register` from its own `Register()` function:
+
+```go internal/npm/npm.go
+func Register() {
+    pkgmanager.Register("npm", func() pkgmanager.PackageManager {
+        return &Adapter{}
+    })
+}
+```
+
+```go internal/pnpm/adapter.go
+func Register() {
+    pkgmanager.Register("pnpm", func() pkgmanager.PackageManager {
+        return &Adapter{}
+    })
+}
+```
+
+---
+
+## Adding a custom package manager
+
+To add support for a new package manager, implement the `PackageManager` interface and register it before SCAL-P's CLI router runs.
+
+<Steps>
+  <Step title="Create your adapter package">
+    Add a new package under `internal/` (e.g., `internal/yarn/`) with a struct that implements all six interface methods.
+
+    ```go internal/yarn/adapter.go
+    package yarn
+
+    import (
+        "context"
+        "scal-p/internal/pkgmanager"
+    )
+
+    type Adapter struct{}
+
+    func (a *Adapter) Name() string { return "yarn" }
+
+    func (a *Adapter) Resolve(ctx context.Context, args ...string) error {
+        // run: yarn install --frozen-lockfile or equivalent
+        return nil
+    }
+
+    func (a *Adapter) GetTree(ctx context.Context) (pkgmanager.DependencyTree, error) {
+        // parse yarn.lock or run: yarn list --json
+        return pkgmanager.DependencyTree{}, nil
+    }
+
+    func (a *Adapter) Install(ctx context.Context, args ...string) error {
+        // run: yarn install [args]
+        return nil
+    }
+
+    func (a *Adapter) ParseLockfile(ctx context.Context) ([]pkgmanager.PackageNode, error) {
+        // read and parse yarn.lock
+        return nil, nil
+    }
+
+    func (a *Adapter) LocalPath(name string) string {
+        return "node_modules/" + name
+    }
+    ```
+  </Step>
+  <Step title="Add a Register function">
+    Add a `Register()` function that calls `pkgmanager.Register` with your adapter's name and constructor:
+
+    ```go internal/yarn/adapter.go
+    func Register() {
+        pkgmanager.Register("yarn", func() pkgmanager.PackageManager {
+            return &Adapter{}
+        })
+    }
+    ```
+  </Step>
+  <Step title="Call Register from main">
+    Import your package and call its `Register()` function before `cli.Run()` in `cmd/scalp/main.go`:
+
+    ```go cmd/scalp/main.go
+    import (
+        "scal-p/internal/npm"
+        "scal-p/internal/pnpm"
+        "scal-p/internal/yarn" // add this
+    )
+
+    func main() {
+        npm.Register()
+        pnpm.Register()
+        yarn.Register() // add this
+        // ...
+    }
+    ```
+  </Step>
+  <Step title="Update IsSupported">
+    Add your new adapter name to the `IsSupported` function in `internal/pkgmanager/pkgmanager.go` so that flag validation accepts it:
+
+    ```go internal/pkgmanager/pkgmanager.go
+    func IsSupported(pm string) bool {
+        switch pm {
+        case "npm", "pnpm", "yarn": // add your name here
+            return true
+        default:
+            return false
+        }
+    }
+    ```
+  </Step>
+</Steps>

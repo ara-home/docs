@@ -1,0 +1,215 @@
+---
+title: "Integrate SCAL-P into GitHub Actions and GitLab CI"
+description: "Run scalp ci in GitHub Actions and GitLab CI to enforce supply chain policy, block violations before install, and capture structured reports as artifacts."
+---
+
+`scalp ci` collapses the full SCAL-P pipeline into a single command: it resolves your lockfile, evaluates every dependency against your policy and trust scores, installs only if all checks pass, hashes the installed packages, audits for tampering, and writes a structured JSON report — all in one shot, with a single exit code. This guide walks through setting it up in GitHub Actions and GitLab CI, choosing the right PR context, and consuming the report output.
+
+## How the command works
+
+`scalp ci` runs an eight-step flow on every invocation:
+
+1. Loads `.scalp/policy.json` (or safe defaults if the file is absent)
+2. Resolves dependencies from the lockfile only — no install yet
+3. Parses the lockfile and evaluates every package against policy and trust score
+4. If any violations exist, writes the report and exits 1 — nothing is installed
+5. Installs dependencies (with `--ignore-scripts` unless opted out)
+6. Computes SHA-512 hashes of each installed package, saves to `.scalp/lockfile.json`
+7. Audits `node_modules` against the lockfile — detects tampering and missing packages
+8. Writes the structured JSON report
+
+```bash
+scalp ci [--pm npm|pnpm] [--output scalp-report.json] [--pr-context fork|internal] [--allow-scripts]
+```
+
+<Note>
+  `scalp ci` always blocks on violation. It does not pass arbitrary flags through to npm or pnpm. Use `scalp install --guarded` for interactive development workflows where you want more control.
+</Note>
+
+## Setting up SCAL-P in CI
+
+<Steps>
+  <Step title="Install the SCAL-P binary">
+    Download the binary for your runner platform from the [SCAL-P releases page](https://github.com/CarlosEduJs/SCAL-P/releases) and place it on `PATH`. Verify the download before use:
+
+    ```bash
+    scalp verify --artifact scalp_linux_amd64.tar.gz --checksum checksums.txt --ci
+    ```
+  </Step>
+
+  <Step title="Choose your PR context">
+    Decide whether PRs come from untrusted forks (`--pr-context fork`, the default) or from team members with repository write access (`--pr-context internal`). This controls how strictly `require_hash` and install scripts are enforced. See [PR context: fork vs internal](#pr-context-fork-vs-internal) below.
+  </Step>
+
+  <Step title="Add scalp ci to your pipeline">
+    Insert `scalp ci` as a step before any step that depends on `node_modules`. Pass `--output` to write the report to a named file so your CI system can upload it as an artifact.
+  </Step>
+
+  <Step title="Upload the report as an artifact">
+    Configure your CI system to save the report file regardless of the job result. The report is always written — even when `scalp ci` exits 1 — so you can inspect failures without rerunning the pipeline.
+  </Step>
+
+  <Step title="Handle exit codes">
+    `scalp ci` exits 0 when all checks pass and 1 when any violation is found. No other exit codes are produced. Wire your pipeline failure condition to this exit code.
+  </Step>
+</Steps>
+
+## GitHub Actions vs GitLab CI
+
+<Tabs>
+  <Tab title="GitHub Actions">
+    Add `scalp ci` as a step in your workflow. Use `actions/upload-artifact` to save the report so it is accessible from the Actions run summary even when the job fails.
+
+    ```yaml
+    name: CI
+
+    on:
+      push:
+        branches: [main]
+      pull_request:
+        branches: [main]
+
+    jobs:
+      scalp:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+
+          - name: Run SCAL-P
+            run: scalp ci --output ci-report.json
+
+          - name: Show report on failure
+            if: failure()
+            run: cat ci-report.json
+
+          - name: Upload report artifact
+            if: always()
+            uses: actions/upload-artifact@v4
+            with:
+              name: scalp-report
+              path: ci-report.json
+    ```
+
+    For pull requests from forks, the default `--pr-context fork` is the correct choice. For PRs from team branches, override to `--pr-context internal`:
+
+    ```yaml
+    - name: Run SCAL-P (internal PR)
+      run: scalp ci --pr-context internal --output ci-report.json
+    ```
+  </Tab>
+  <Tab title="GitLab CI">
+    Use the `artifacts` keyword to upload the report. GitLab preserves artifacts on both success and failure when `when: always` is set.
+
+    ```yaml
+    scalp:
+      stage: test
+      script:
+        - scalp ci --output scalp-report.json
+      artifacts:
+        when: always
+        paths:
+          - scalp-report.json
+        expire_in: 7 days
+    ```
+
+    For internal pipelines (team members with write access):
+
+    ```yaml
+    scalp:
+      stage: test
+      script:
+        - scalp ci --pr-context internal --output scalp-report.json
+      artifacts:
+        when: always
+        paths:
+          - scalp-report.json
+    ```
+  </Tab>
+</Tabs>
+
+## PR context: fork vs internal
+
+`--pr-context` tells `scalp ci` how much trust to extend to the code being evaluated. The default is `fork` because that is the safest assumption for any automated pipeline — a fork PR could have altered the lockfile or removed integrity entries.
+
+| Context | `require_hash` | Install scripts | Intended use case |
+|---|---|---|---|
+| `fork` (default) | Forced on, overrides policy | Blocked unconditionally | PRs from untrusted forks |
+| `internal` | Respects your `policy.json` setting | Blocked unless `--allow-scripts` | PRs from team members |
+
+**Fork mode** ignores whatever `require_hash` value is in your policy and enforces it as `true`. Every package must have a lockfile integrity entry. This is non-negotiable: a fork could have stripped hashes to smuggle an unverified package through.
+
+**Internal mode** applies your policy as written. If your policy sets `require_hash: false` and you trust your team, that is respected. Install scripts are still blocked by default — you must explicitly pass `--allow-scripts` to enable them.
+
+<Warning>
+  `--allow-scripts` only takes effect with `--pr-context internal`. Passing `--allow-scripts` without `--pr-context internal` has no effect — install scripts remain blocked.
+</Warning>
+
+## Install scripts blocked by default
+
+npm and pnpm packages can execute arbitrary code during installation via `preinstall`, `install`, and `postinstall` scripts. This is one of the most common supply chain attack vectors.
+
+`scalp ci` passes `--ignore-scripts` to the package manager unconditionally. No lifecycle scripts run. No postinstall hooks. No surprise binaries dropped to disk.
+
+To enable scripts in a trusted internal context:
+
+```bash
+scalp ci --pr-context internal --allow-scripts
+```
+
+This is a deliberate, two-flag opt-in. If you need scripts, you should be able to explain why.
+
+## Report format
+
+The report is written to `--output` (default: `.scalp/ci-report.json`). Pass `--output -` to write to stdout instead.
+
+```json
+{
+  "version": "0.2",
+  "passed": false,
+  "violations": [
+    {
+      "package": "evil@1.0",
+      "reason": "trust_score: 17/50 (hash:0, maturity:0, dl:10, cves:7)",
+      "rule": "min_score:50"
+    }
+  ],
+  "audit": {
+    "verified": 42,
+    "mismatched": 0,
+    "missing": 1
+  }
+}
+```
+
+`passed` is `true` only when both policy evaluation and hash audit find zero issues.
+
+The `audit` section summarizes the hash verification pass:
+
+| Field | Meaning |
+|---|---|
+| `verified` | On-disk hash matches the lockfile entry |
+| `mismatched` | On-disk hash differs from the lockfile (tampered or corrupted) |
+| `missing` | Package is in the dependency tree but absent from the lockfile, or not installed |
+
+For local debugging, pipe the report directly to your terminal:
+
+```bash
+scalp ci --output -
+```
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | All checks passed — policy, trust scores, and hashes |
+| `1` | Violations found — inspect the report for details |
+
+If `scalp ci` fails to resolve or install (for example, due to a network error), it prints a diagnostic message to stderr and exits 1. There are no other exit codes.
+
+## Limitations
+
+- Does not check for newer versions of packages — use `npm outdated` for that
+- Does not publish or post reports anywhere — pipe or upload them yourself
+- Does not accept npm or pnpm passthrough arguments
+- Does not produce SARIF output yet (planned for v0.3)
+- Does not run in watch or daemon mode

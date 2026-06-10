@@ -1,0 +1,64 @@
+---
+title: "SCAL-P: a security layer for npm and pnpm projects"
+description: "SCAL-P enforces dependency policies, verifies package integrity with SHA-512 hashes, and logs every install — with zero external Go dependencies."
+---
+
+SCAL-P (Secure Chain Assurance Layer for Packages) is a Go CLI tool that wraps npm and pnpm to enforce supply chain security before any package code runs. Instead of trusting what arrives from the registry, SCAL-P resolves your lockfile, evaluates every dependency against your policy, hashes each installed package, and writes an immutable audit trail — all with zero external Go dependencies and no network requirement for core operations.
+
+## Why supply chain security matters
+
+npm and pnpm run arbitrary lifecycle scripts during install. A compromised or malicious package can execute code the moment you run `npm install`. SCAL-P flips the default: **policy before trust, hash after install, audit always.**
+
+Supply chain attacks against JavaScript projects have increased significantly. Typosquatting, dependency confusion, and post-install script abuse are the most common vectors. SCAL-P addresses each:
+
+- **Policy enforcement** blocks packages that don't meet your allow/deny rules before install starts
+- **Trust scoring** gives every package a numeric risk score based on hash status, version maturity, download volume, and CVE presence
+- **Hash verification** confirms that `node_modules` matches what was installed — detecting tampering after the fact
+- **Audit logging** produces an append-only NDJSON record of every event for compliance and forensics
+
+## Design principles
+
+SCAL-P is built around three constraints that make it reliable in security-sensitive environments.
+
+**Zero external Go dependencies.** The entire codebase uses only the Go standard library. There is no dependency chain to audit for the tool itself — what you see in the repository is everything that runs.
+
+**Offline-first.** Network calls (npm download stats, CVE lookups) are optional and cached. A network failure causes trust score degradation, not a broken install. Core policy enforcement — allowlists, denylists, hash checks — works entirely offline.
+
+**Stateless CLI.** SCAL-P reads your lockfile and writes to `.scalp/`. It carries no daemon, no background process, and no persistent state outside that directory. Every command is independently repeatable.
+
+<Info>
+  SCAL-P verifies its own release binaries using the same SHA-512 engine it uses for packages. Run `scalp verify` to check any SCAL-P release artifact against the published checksums file.
+</Info>
+
+## How it fits into your workflow
+
+SCAL-P works alongside your existing package manager — it does not replace npm or pnpm. You call `scalp install` or `scalp ci` instead of `npm install` directly. SCAL-P intercepts the install, runs its checks, then delegates to your package manager if everything passes.
+
+```bash
+scalp install --guarded    # resolve → evaluate → block → install → sync
+scalp audit                # verify lockfile hashes match node_modules
+scalp ci                   # single CI command: all of the above + JSON report
+```
+
+In CI, `scalp ci` is the recommended entry point. It always exits 1 on violations, passes `--ignore-scripts` to your package manager, and writes a machine-readable JSON report.
+
+<Note>
+  No `.scalp/policy.json` file? SCAL-P defaults to audit-only mode — it hashes and logs everything without blocking. This is the safe starting point before you define your policy.
+</Note>
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Download a pre-built binary for Linux or macOS, or build from source with `make build`.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run your first guarded install and see policy enforcement in action in under two minutes.
+  </Card>
+  <Card title="Commands" icon="terminal" href="/commands/install">
+    Every command, flag, and default value documented with real examples.
+  </Card>
+  <Card title="Policy configuration" icon="shield-check" href="/configuration/policy">
+    Configure allowlists, denylists, trust scores, and enforcement modes.
+  </Card>
+</CardGroup>

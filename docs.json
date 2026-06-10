@@ -1,0 +1,74 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "SCAL-P",
+  "theme": "aspen",
+  "colors": {
+    "primary": "#1A7A6E",
+    "light": "#E8F5F3",
+    "dark": "#0D4A44"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/CarlosEduJs/SCAL-P"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/CarlosEduJs/SCAL-P"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Commands",
+            "pages": [
+              "commands/install",
+              "commands/audit",
+              "commands/ci",
+              "commands/policy-check",
+              "commands/verify",
+              "commands/checksum"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/policy",
+              "configuration/trust-score",
+              "configuration/package-managers"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/ci-integration",
+              "guides/binary-verify",
+              "guides/architecture"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/policy-schema",
+              "reference/audit-log",
+              "reference/lockfile",
+              "reference/troubleshooting"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

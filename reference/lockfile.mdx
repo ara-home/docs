@@ -1,0 +1,117 @@
+---
+title: "Lockfile reference for SCAL-P (.scalp/lockfile.json)"
+description: "Auto-generated SHA-512 hash store for supply chain verification — file structure, how entries are created, and how they power trust scoring and auditing."
+---
+
+After every guarded install or `scalp ci` run, SCAL-P hashes each package directory in `node_modules` using SHA-512 and stores the results in `.scalp/lockfile.json`. On subsequent `scalp audit` or `scalp ci` runs it re-hashes the same directories and compares the results against the stored entries, detecting any modifications made after installation. Do not commit this file to version control — it is local state that must reflect the actual on-disk packages.
+
+<Warning>
+Do not commit `.scalp/lockfile.json` to version control. The file captures hashes of your local `node_modules`, which are machine-specific and large. Add it to `.gitignore` alongside `.scalp/cache/` and `.scalp/audit.log`.
+</Warning>
+
+## File structure
+
+The lockfile is a JSON object with three top-level fields, as defined in `internal/lockfile/lockfile.go`:
+
+<ResponseField name="lockVersion" type="integer">
+  Internal schema version. Always `1` in the current release.
+</ResponseField>
+
+<ResponseField name="generatedAt" type="string">
+  RFC 3339 UTC timestamp of the last write. Updated every time `SyncWithTree` completes.
+</ResponseField>
+
+<ResponseField name="packages" type="object">
+  A map of `"name@version"` keys to lock entries. Keys use the exact package name and resolved version, for example `"lodash@4.17.21"`.
+
+  <Expandable title="entry fields">
+    <ResponseField name="resolved" type="string">
+      The resolved URL for the package, as reported by the package manager's dependency tree (`npm ls --all --json` or `pnpm ls --json`). May be empty for locally resolved packages.
+    </ResponseField>
+
+    <ResponseField name="integrity" type="string">
+      SHA-512 hash of the entire package directory in `sha512-<base64>` format, computed by `hash.Dir()`. This value is recomputed on every audit and compared against this field to detect tampering or corruption.
+    </ResponseField>
+
+    <ResponseField name="verifiedAt" type="string">
+      RFC 3339 UTC timestamp of when this entry was last written or verified.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Example
+
+```json
+{
+  "lockVersion": 1,
+  "generatedAt": "2026-05-17T14:32:05Z",
+  "packages": {
+    "lodash@4.17.21": {
+      "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+      "integrity": "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXPs17LhbZngClnHWbcpKolF3rg==",
+      "verifiedAt": "2026-05-17T14:32:05Z"
+    },
+    "express@4.18.2": {
+      "resolved": "https://registry.npmjs.org/express/-/express-4.18.2.tgz",
+      "integrity": "sha512-pMDNBcVQcGlQ3o3r8Iz2rjMl5KXHWQ8kZnJ2TIKCNerFtqXQqLB/8CRqxjr/5oe3MuPZ/Wf8J6q6K+FWWQ==",
+      "verifiedAt": "2026-05-17T14:32:05Z"
+    }
+  }
+}
+```
+
+## How the lockfile is generated
+
+SCAL-P generates the lockfile through `SyncWithTree()` in `internal/lockfile/sync.go`. The process runs at the end of every guarded install and at the hash-sync step of `scalp ci`:
+
+1. **Flatten the dependency tree** — `pkgmanager.Flatten(tree)` turns the nested tree returned by `npm ls` or `pnpm ls` into a flat list of `PackageNode` records.
+2. **Locate each package directory** — SCAL-P checks the path reported by the package manager first, then falls back to `node_modules/<name>`. For pnpm, symlinks are resolved to their real paths before hashing, because `hash.Dir` operates on real directories.
+3. **Hash the directory** — `hash.Dir(ctx, pkgDir)` computes a SHA-512 digest over every file in the package directory. The result is stored as `sha512-<base64>`.
+4. **Write the entry** — The `packages["name@version"]` entry is updated with `resolved`, `integrity`, and `verifiedAt`.
+5. **Save atomically** — The file is written atomically using a temp-file rename to prevent partial writes.
+
+Packages whose directory cannot be found (optional platform packages that weren't installed on the current OS, for example) emit a `hash_skipped` audit event and are omitted from the lockfile for that run.
+
+## How the lockfile is used
+
+### Audit verification
+
+`scalp audit` and the verification step of `scalp ci` call `VerifyAgainstTree()`. For each package in the current dependency tree, SCAL-P re-hashes the directory and compares the result against the stored `integrity` field:
+
+- **Match** → `hash_check` event with `status: "verified"` and `hash_match: true`.
+- **Mismatch** → `hash_check` event with `status: "mismatch"`, plus a `hash_mismatch` violation. This indicates the package was modified after install — either tampered with or corrupted.
+- **Package not in lockfile** → `hash_missing` event and a `missing_lock_entry` violation. This means the package was installed outside of SCAL-P's guarded flow.
+- **Package not installed** → `hash_check` event with `status: "missing"` and a `package_not_installed` violation.
+
+### Trust scoring
+
+When `trust.min_score` is greater than `0`, the trust scorer checks whether each package has a non-empty `integrity` entry in the lockfile. If it does, the package earns **30 points** (the hash-verified factor). If the entry is missing or empty, it earns 0 points for that factor. When `trust.require_hash` is also `true`, a missing entry is an immediate violation regardless of the total score.
+
+## What triggers regeneration
+
+The lockfile is updated in two situations:
+
+- **`scalp install --guarded`** — After a successful install, `SyncWithTree` re-hashes all packages and overwrites existing entries with fresh values.
+- **`scalp ci`** — After the install step, `SyncWithTree` is always called. This ensures the lockfile reflects the exact state installed in the CI environment.
+
+Running `scalp install` without `--guarded` still calls `SyncWithTree` and updates the lockfile — it just skips the pre-install policy evaluation.
+
+## How to regenerate
+
+If you need to rebuild the lockfile from scratch (for example after deleting it or after a clean install):
+
+```bash
+scalp install --guarded
+```
+
+Or in CI:
+
+```bash
+scalp ci
+```
+
+Both commands run `SyncWithTree` at the end and write a fresh `.scalp/lockfile.json`.
+
+<Note>
+The lockfile is not a replacement for `package-lock.json` or `pnpm-lock.yaml`. Those files pin exact package versions for reproducible installs. The SCAL-P lockfile stores content hashes to verify that installed packages match what was hashed at install time.
+</Note>

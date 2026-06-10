@@ -1,0 +1,239 @@
+---
+title: "Trust score: how SCAL-P scores dependency risk (0–80)"
+description: "Understand the 0–80 trust scoring system, all four scoring factors, offline behavior, cache mechanics, and how violations are reported."
+---
+
+Every dependency SCAL-P evaluates receives a deterministic numeric score from 0 to 80, computed from four independent factors. The score gives you a risk dimension on top of allow/deny rules: a package with millions of weekly downloads and no known CVEs should not carry the same risk weight as a freshly published `0.0.1` with no lockfile hash.
+
+Trust scoring is disabled by default (`min_score: 0`). To activate it, set `trust.min_score` in your [policy](/configuration/policy) to any value between 1 and 80. Packages scoring below that threshold trigger a violation, which is then handled according to your `enforcement.on_violation` setting.
+
+<Note>
+Trust scoring is designed to be offline-first. When SCAL-P cannot reach the npm registry or run `npm audit`, it awards partial points rather than failing or awarding zero. Unknown data is penalized, but never treated as confirmed bad. See [Unknown vs Bad](#unknown-vs-bad) below.
+</Note>
+
+---
+
+## Scoring factors at a glance
+
+| Factor | Max points | Source | Works offline? |
+|--------|-----------|--------|----------------|
+| Hash verified | 30 | `.scalp/lockfile.json` | Yes — fully local |
+| Version maturity | 15 | Lockfile version field | Yes — fully local |
+| Weekly downloads | 20 | `api.npmjs.org` (cached) | Degraded — 10 pts |
+| No active CVEs | 15 | `npm audit --json` (cached) | Degraded — 7 pts |
+
+The maximum possible score is **80**. Set `min_score` to any value in this range to create a pass/fail threshold.
+
+```json policy.json
+{
+  "trust": {
+    "min_score": 60,
+    "require_hash": true
+  }
+}
+```
+
+---
+
+## Unknown vs Bad
+
+This is the most important design decision in the scoring system.
+
+**Unknown** means SCAL-P could not determine the true value — no network, no audit output, no cached data. Unknown earns **half points** as a penalty. The package is not assumed to be safe, but it is not assumed to be dangerous either.
+
+**Bad** means SCAL-P checked and the result was definitively negative — low downloads confirmed, open CVEs confirmed. Bad earns **0 points**.
+
+| Factor | Unknown (offline / no data) | Bad (checked and failed) |
+|--------|----------------------------|--------------------------|
+| Weekly downloads | 10 pts | 0 pts (fewer than 100/week) |
+| No active CVEs | 7 pts | 0 pts (open CVEs found) |
+
+**Download examples:**
+
+- Offline, no cache → **10 pts** (unknown)
+- Online, 50 downloads/week → **0 pts** (bad — below the lowest threshold)
+- Online, 500,000 downloads/week → **20 pts** (good)
+
+**CVE examples:**
+
+- Pre-install with no `node_modules` to audit → **7 pts** (unknown)
+- `npm audit` ran and found CVEs for this package → **0 pts** (bad)
+- `npm audit` ran and found no CVEs → **15 pts** (good)
+
+---
+
+## The four factors
+
+<AccordionGroup>
+  <Accordion title="Hash verified — 30 points">
+    SCAL-P's guarded install (`scalp install --guarded`) syncs SHA-512 hashes of every installed package directory into `.scalp/lockfile.json`. If a package has a non-empty integrity entry in that file, it earns 30 points.
+
+    A missing entry means either the package was installed outside SCAL-P's guarded flow, or the lockfile was modified after installation. In either case: **0 points**.
+
+    This factor directly rewards packages that went through the full SCAL-P pipeline. Manual `npm install` runs without `--guarded`, or lockfile edits, produce a 0 here.
+
+    **With `require_hash: true`:** A missing hash is not just 0 points — it is an automatic `hash_required` violation, independent of the total score. The package is excluded from trust scoring entirely and the violation is raised immediately.
+
+    ```
+    hash_required: package integrity not in lockfile
+    ```
+  </Accordion>
+
+  <Accordion title="Version maturity — 15 points">
+    Packages with a major version of `1` or higher earn 15 points. Pre-release packages (any version below `1.0.0`, such as `0.5.2` or `0.12.0-beta`) earn 0 points.
+
+    The check uses zero-dependency parsing: split the version string on `.`, parse the first component as an integer. Prefixes like `v`, range operators like `^` or `~`, and suffixes like `-beta` are stripped. All of these parse correctly: `^0.5.0`, `~1.2.3`, `v2.0`.
+
+    This factor captures a coarse signal: pre-release packages have no stability guarantee and may have rapidly changing APIs. They are not necessarily dangerous, but they warrant more scrutiny.
+  </Accordion>
+
+  <Accordion title="Weekly downloads — 0 to 20 points">
+    SCAL-P fetches weekly download counts from the npm registry and maps them to points on a logarithmic scale.
+
+    | Downloads per week | Points |
+    |--------------------|--------|
+    | Fewer than 100 | 0 |
+    | 100 – 999 | 5 |
+    | 1,000 – 9,999 | 10 |
+    | 10,000 – 99,999 | 15 |
+    | 100,000 or more | 20 |
+
+    **Data source:** `GET https://api.npmjs.org/downloads/point/last-week/{name}`
+
+    **Cache:** Results are stored in `.scalp/cache/trust.json` with a 7-day TTL. After the TTL expires the entry is considered stale; SCAL-P attempts a fresh fetch and falls back to the stale value if the network is unavailable.
+
+    **Timeout:** Each HTTP call has a 10-second timeout. If it times out or fails with no cached data, the scorer moves on and awards **10 points** (unknown).
+
+    **Offline with no cache:** **10 pts** (unknown).  
+    **Offline with stale cache:** Uses the stale cached value without penalty.
+  </Accordion>
+
+  <Accordion title="No active CVEs — 0 or 15 points">
+    SCAL-P runs `npm audit --json` once per evaluation session and maps the vulnerability output to individual packages by name and exact version.
+
+    **When `npm audit` succeeds:**
+    - Package has open CVEs → **0 pts**
+    - Package has no CVEs → **15 pts**
+
+    **When `npm audit` fails** (pre-install, no `node_modules`, missing lockfile, etc.):
+    - Cache has a confirmed CVE entry for this exact version → **0 pts** (previously confirmed bad)
+    - Cache has a clean entry for this exact version → **15 pts** (previously confirmed clean)
+    - No cache entry for this version → **7 pts** (unknown)
+
+    Note that CVE data is version-specific. `lodash@4.17.20` may have known vulnerabilities while `lodash@4.17.21` does not. The cache stores per-version entries to reflect this.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Hard fail: `require_hash`
+
+```json policy.json
+{
+  "trust": {
+    "require_hash": true
+  }
+}
+```
+
+When `require_hash` is enabled, any package without a lockfile integrity entry triggers an automatic violation before trust scoring even runs. The violation message is:
+
+```
+hash_required: package integrity not in lockfile
+```
+
+This is your supply-chain minimum switch. If a package was not installed through SCAL-P's guarded flow, or if the lockfile was tampered with after installation, you find out immediately — not just through a lower score.
+
+`require_hash` and `min_score` are evaluated independently. Both can be active at the same time:
+
+```json policy.json
+{
+  "trust": {
+    "require_hash": true,
+    "min_score": 50
+  }
+}
+```
+
+| Package state | Outcome |
+|--------------|---------|
+| No hash in lockfile | Violation: `hash_required` |
+| Has hash, score below `min_score` | Violation: `trust_score_too_low` |
+| Has hash, score at or above `min_score` | Passes |
+
+---
+
+## Cache
+
+**File:** `.scalp/cache/trust.json`
+
+The cache is auto-managed by SCAL-P. Do not commit it — add `.scalp/cache/` to your `.gitignore`.
+
+```json .scalp/cache/trust.json
+{
+  "lodash": {
+    "fetched_at": "2026-05-13T12:00:00Z",
+    "weekly_downloads": 142536,
+    "versions": {
+      "4.17.21": {
+        "fetched_at": "2026-05-13T12:00:00Z",
+        "cves": []
+      },
+      "4.17.20": {
+        "fetched_at": "2026-05-10T12:00:00Z",
+        "cves": ["GHSA-xxx"]
+      }
+    }
+  }
+}
+```
+
+Top-level keys are package names. `weekly_downloads` is per-package (the same value applies across all versions of a package). The `versions` map holds per-version data — specifically CVE results, which differ between versions.
+
+**TTL:** 7 days from `fetched_at` for the top-level entry. Each version entry has its own `fetched_at` timestamp.
+
+**Load strategy:** The scorer loads the cache once at the start of `Evaluate()`, reads and writes entries during scoring, and saves only if something changed (dirty flag). This avoids unnecessary disk writes on cache-only runs.
+
+---
+
+## Violation messages
+
+Trust violations include a per-factor breakdown so you can see exactly why a package failed:
+
+```
+trust_score: 17/50 (hash:0, maturity:0, dl:10, cves:7)
+```
+
+This example means: no lockfile hash (0/30), pre-release version (0/15), unknown download count (10/20 — offline), unknown CVE status (7/15 — pre-install). One glance tells you the package is new, untracked, and being installed in a network-restricted environment.
+
+The breakdown fields map directly to the four factors:
+
+| Field | Factor |
+|-------|--------|
+| `hash` | Hash verified (0 or 30) |
+| `maturity` | Version maturity (0 or 15) |
+| `dl` | Weekly downloads (0, 5, 10, 15, or 20) |
+| `cves` | No active CVEs (0, 7, or 15) |
+
+---
+
+## Enforcement
+
+Trust violations use the same enforcement path as policy violations. There is no separate enforcement mode for trust scoring:
+
+| `on_violation` | Behavior |
+|----------------|----------|
+| `block` | Exit 1. Install is skipped in guarded mode. |
+| `warn` | Log to stderr and continue. |
+| `log` | Silently append to `.scalp/audit.log` and continue. |
+
+If you need trust violations to block while allowlist violations only warn, that is not currently supported. Open an issue on GitHub if that is a real need for your workflow.
+
+---
+
+## What trust scoring does not cover (v0.2)
+
+- Two-factor authentication or verified publisher status (npm does not expose this per-package)
+- Sigstore provenance attestations (planned for v0.3)
+- Typosquatting or dependency confusion detection
+- Persistent background daemon — every SCAL-P invocation is stateless

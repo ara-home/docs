@@ -1,0 +1,135 @@
+---
+title: "scalp install: Policy-enforced package installation"
+description: "Install npm or pnpm packages with optional policy enforcement, trust scoring, and SHA-512 hash verification before any code runs on your machine."
+---
+
+`scalp install` wraps your package manager's install step with an optional security layer. Without flags it behaves like a transparent passthrough — it runs the install and then records SHA-512 hashes of every installed package to `.scalp/lockfile.json`. Add `--guarded` and the command becomes a full enforcement pipeline: dependencies are resolved and evaluated against your policy before a single byte of package code touches your disk.
+
+## Synopsis
+
+```bash
+scalp install [--guarded] [--pm npm|pnpm] [--policy <file>] [--ci] [-- <pm-args...>]
+```
+
+## Flags
+
+<ParamField path="--guarded" type="boolean" default="false">
+  Enable full security enforcement before install. When set, SCAL-P resolves the lockfile, evaluates every package against your policy and trust scores, and blocks the install if any violations are found. Without this flag, SCAL-P installs first and only syncs hashes afterward.
+</ParamField>
+
+<ParamField path="--pm" type="string" default="npm">
+  Package manager to use. Accepted values: `npm`, `pnpm`. The value is case-insensitive.
+</ParamField>
+
+<ParamField path="--policy" type="string" default=".scalp/policy.json">
+  Path to the policy file. If the file does not exist, SCAL-P logs a `policy_missing` audit event and continues in warn-only mode.
+</ParamField>
+
+<ParamField path="--ci" type="boolean" default="false">
+  Override enforcement to `block` regardless of what `on_violation` is set to in your policy file. Use this in automated pipelines where you want hard failures on any violation.
+</ParamField>
+
+## Modes
+
+`scalp install` has two distinct behaviors depending on whether `--guarded` is passed.
+
+### Passthrough mode (default)
+
+Without `--guarded`, SCAL-P delegates directly to your package manager and then records hashes:
+
+<Steps>
+  <Step title="Install packages">
+    Runs `npm install` (or `pnpm install`) with any extra arguments you pass after `--`.
+  </Step>
+  <Step title="Hash sync">
+    Computes SHA-512 hashes for every installed package directory and writes them to `.scalp/lockfile.json`. New packages are added; existing entries are updated.
+  </Step>
+</Steps>
+
+### Guarded mode (`--guarded`)
+
+With `--guarded`, policy and trust enforcement happen before the install:
+
+<Steps>
+  <Step title="Resolve dependencies">
+    Runs the package manager's lockfile-only resolution step (no install). This produces an up-to-date lockfile without executing any package code.
+  </Step>
+  <Step title="Parse lockfile">
+    Reads every dependency node from the resolved lockfile.
+  </Step>
+  <Step title="Evaluate policy">
+    Checks each package against your allow/deny rules, minimum trust score, and `require_hash` setting in `.scalp/policy.json`.
+  </Step>
+  <Step title="Check trust scores">
+    If `trust.min_score > 0` or `trust.require_hash` is enabled, each package is scored against four factors: hash verification (30 pts), version maturity (15 pts), download volume (0–20 pts), and CVE status (0–15 pts).
+  </Step>
+  <Step title="Enforce violations">
+    If any violations are found, they are written to `.scalp/audit.log`. Depending on your `on_violation` setting (or `--ci`), SCAL-P either blocks with exit code 1, prints a warning and continues, or logs silently.
+  </Step>
+  <Step title="Install packages">
+    Only reached if no violations blocked the run. Delegates to your package manager with any extra arguments.
+  </Step>
+  <Step title="Hash sync">
+    Computes SHA-512 hashes for every installed package directory and saves them to `.scalp/lockfile.json`.
+  </Step>
+</Steps>
+
+<Note>
+  If no policy file is found, SCAL-P logs a `policy_missing` audit event and proceeds in audit-only mode — packages are installed and hashed, but nothing is blocked.
+</Note>
+
+## Examples
+
+<CodeGroup>
+
+```bash Passthrough install (npm)
+scalp install
+```
+
+```bash Passthrough install (pnpm)
+scalp install --pm pnpm
+```
+
+</CodeGroup>
+
+<CodeGroup>
+
+```bash Guarded install (npm)
+scalp install --guarded
+```
+
+```bash Guarded install (pnpm)
+scalp install --guarded --pm pnpm
+```
+
+</CodeGroup>
+
+```bash Guarded install with CI blocking
+scalp install --guarded --ci
+```
+
+```bash Pass extra arguments to npm
+scalp install --guarded -- --prefer-offline --no-audit
+```
+
+```bash Use a custom policy file
+scalp install --guarded --policy .scalp/strict-policy.json
+```
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Install completed successfully. |
+| `1` | A violation was found and enforcement is set to `block`, or the package manager itself failed. |
+
+## Files written
+
+| Path | Description |
+|------|-------------|
+| `.scalp/lockfile.json` | SHA-512 hashes for every installed package directory. Created if absent; updated on each install. |
+| `.scalp/audit.log` | NDJSON audit events for policy violations and hash sync operations. Append-only. |
+
+<Tip>
+  Run `scalp audit` after install to verify that `node_modules` still matches `.scalp/lockfile.json`. This detects any tampering that may have occurred between install and audit.
+</Tip>

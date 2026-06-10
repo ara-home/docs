@@ -1,0 +1,164 @@
+---
+title: "Policy schema reference for SCAL-P (.scalp/policy.json)"
+description: "Complete field-by-field reference for the SCAL-P policy file, which controls dependency verification, trust scoring, and enforcement behavior."
+---
+
+The policy file at `.scalp/policy.json` is the single source of truth for how SCAL-P evaluates your dependencies. It follows [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12/schema) and is validated against the bundled schema at `.scalp/policy.schema.json`. Only `version` is required; all other fields have safe defaults that produce an audit-only, non-blocking posture.
+
+<Tip>
+Add `"$schema": "https://raw.githubusercontent.com/CarlosEduJs/SCAL-P/main/.scalp/policy.schema.json"` to your `policy.json` for inline autocomplete and validation in VS Code, JetBrains IDEs, and any editor that supports JSON Schema.
+</Tip>
+
+## Top-level fields
+
+<ResponseField name="$schema" type="string">
+  Optional. A URI pointing to the JSON Schema for this file. Set it to the canonical URL below to enable editor autocomplete and validation.
+
+  ```
+  https://raw.githubusercontent.com/CarlosEduJs/SCAL-P/main/.scalp/policy.schema.json
+  ```
+</ResponseField>
+
+<ResponseField name="version" type="integer" required>
+  Schema version. The only accepted value is `1`. SCAL-P uses this field to detect incompatible future policy formats.
+</ResponseField>
+
+<ResponseField name="trust" type="object">
+  Controls which packages are evaluated, how trust scoring works, and whether missing hashes are a hard failure.
+
+  <Expandable title="properties">
+    <ResponseField name="trust.mode" type="string" default="audit-only">
+      Determines which packages are subject to policy evaluation.
+
+      | Value | Behavior |
+      |---|---|
+      | `allowlist` | Only packages explicitly listed in `packages.allow` are permitted. Everything else is a violation. |
+      | `denylist` | All packages are permitted except those explicitly listed in `packages.deny`. |
+      | `audit-only` | All packages are logged but nothing is blocked regardless of policy rules. |
+    </ResponseField>
+
+    <ResponseField name="trust.min_score" type="integer" default="0">
+      Minimum trust score (0–80). Packages whose computed score falls below this threshold trigger a violation. Setting this to `0` (the default) disables trust scoring entirely — no score is computed and no score-based violations are raised.
+
+      The four factors that contribute to the score are: hash verified (30 pts), version maturity — `>= 1.0.0` (15 pts), weekly npm downloads (0–20 pts), and no active CVEs (0 or 15 pts).
+    </ResponseField>
+
+    <ResponseField name="trust.require_hash" type="boolean" default="false">
+      When `true`, any package that does not have an entry in `.scalp/lockfile.json` is an automatic violation regardless of its total trust score. The violation reason is `hash_required`. This check is independent of `min_score` and is evaluated first.
+
+      Use this as your supply-chain minimum: if a package was not installed through SCAL-P's guarded flow (or was modified after install), you want to know immediately rather than relying on a lower score.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="packages" type="object">
+  Allow and deny rules for specific packages or name patterns. Rules are evaluated according to the active `trust.mode`.
+
+  <Expandable title="properties">
+    <ResponseField name="packages.allow" type="PackageRule[]" default="[]">
+      List of packages permitted in `allowlist` mode. An empty array blocks every package. Each item is a [PackageRule](#packagerule).
+    </ResponseField>
+
+    <ResponseField name="packages.deny" type="PackageRule[]" default="[]">
+      List of packages blocked in `denylist` mode. An empty array allows every package. Each item is a [PackageRule](#packagerule).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="transitive" type="object">
+  Limits on transitive (indirect) dependencies.
+
+  <Expandable title="properties">
+    <ResponseField name="transitive.max_depth" type="integer" default="0">
+      Maximum nesting depth for transitive dependencies. `0` means no depth limit is enforced. Any package nested deeper than `max_depth` levels triggers a violation.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="enforcement" type="object">
+  Controls what SCAL-P does when a violation is detected.
+
+  <Expandable title="properties">
+    <ResponseField name="enforcement.on_violation" type="string" default="warn">
+      Action taken when a package violates policy or trust scoring.
+
+      | Value | Behavior |
+      |---|---|
+      | `block` | Exit with code 1. The install or audit command is aborted. |
+      | `warn` | Print the violation and continue. |
+      | `log` | Record the violation silently and continue. |
+    </ResponseField>
+
+    <ResponseField name="enforcement.default_mode" type="string" default="passthrough">
+      The install mode used when `--guarded` is not passed on the command line.
+
+      | Value | Behavior |
+      |---|---|
+      | `guarded` | Always run the full resolve → evaluate → enforce → install → sync pipeline. |
+      | `passthrough` | Run install directly without policy evaluation. Hash sync still runs. |
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## PackageRule
+
+A `PackageRule` matches one or more packages by exact name, glob pattern, version constraint, or expected checksum. Every rule must include either `name` or `pattern` — both cannot be absent.
+
+<ResponseField name="name" type="string">
+  Exact package name to match. Supports scoped packages.
+
+  **Examples:** `"lodash"`, `"@scope/package"`
+</ResponseField>
+
+<ResponseField name="pattern" type="string">
+  Glob pattern for matching multiple packages. Supports `*` (any), `*suffix`, `prefix*`, `*substr*`, and `@scope/*`.
+
+  **Examples:** `"*-free"`, `"@scope/*"`, `"*substr*"`
+</ResponseField>
+
+<ResponseField name="versions" type="string">
+  Optional npm semver range. When present, the rule applies only to packages whose resolved version matches the constraint.
+
+  **Examples:** `"^4.0.0"`, `">=1.0.0"`
+</ResponseField>
+
+<ResponseField name="checksum" type="string">
+  Optional expected SHA-512 integrity hash in `sha512-<base64>` format. When present, the rule matches only packages whose lockfile integrity entry equals this value.
+
+  **Example:** `"sha512-a1b2c3d4..."`
+</ResponseField>
+
+## Complete example
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/CarlosEduJs/SCAL-P/main/.scalp/policy.schema.json",
+  "version": 1,
+  "trust": {
+    "mode": "allowlist",
+    "min_score": 60,
+    "require_hash": true
+  },
+  "packages": {
+    "allow": [
+      { "name": "lodash", "versions": "^4.0.0" },
+      { "pattern": "@your-org/*" }
+    ],
+    "deny": [
+      { "pattern": "*-free" },
+      { "pattern": "@evil-scope/*" }
+    ]
+  },
+  "transitive": {
+    "max_depth": 5
+  },
+  "enforcement": {
+    "on_violation": "block",
+    "default_mode": "guarded"
+  }
+}
+```
+
+<Note>
+`packages.deny` is evaluated even when `trust.mode` is `allowlist`. A package in `packages.allow` that also matches a `packages.deny` rule is still blocked. Deny rules take precedence.
+</Note>

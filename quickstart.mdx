@@ -1,0 +1,162 @@
+---
+title: "Quickstart: run your first SCAL-P guarded npm install"
+description: "Go from zero to a policy-enforced install in two minutes. Run scalp ci, read the report, add a policy, and enforce it in CI — step by step."
+---
+
+This guide takes you from a fresh SCAL-P installation to a policy-enforced install in about two minutes. You need a JavaScript project with a `package.json` — everything else is handled by SCAL-P. No config is required to get started; you can add policy enforcement progressively as you become familiar with your dependency profile.
+
+<Steps>
+  <Step title="Go to your project directory">
+    Navigate to any JavaScript project that has a `package.json` and a lockfile (`package-lock.json` or `pnpm-lock.yaml`):
+
+    ```bash
+    cd my-project
+    ```
+
+    SCAL-P reads your existing lockfile to resolve dependencies before installing. No lockfile means SCAL-P cannot evaluate dependencies ahead of install — make sure one exists.
+  </Step>
+
+  <Step title="Run your first CI check">
+    Run `scalp ci` with no arguments:
+
+    ```bash
+    scalp ci
+    ```
+
+    No config. No setup. `scalp ci` does everything in one pass: resolves dependencies from the lockfile, evaluates them against policy, installs via npm, hashes every installed package directory with SHA-512, and saves a structured report to `.scalp/ci-report.json`.
+
+    On the first run with no policy file, you will see output like this:
+
+    ```
+    WARN policy not found; allowing with audit
+    INFO binary verified artifact=lodash…
+    INFO binary verified artifact=express…
+    INFO ci passed: 0 violations
+    ```
+
+    All packages pass because the default policy is audit-only — SCAL-P hashes and logs everything without blocking. This is the safe default.
+
+    <Info>
+      Using pnpm? Pass `--pm pnpm` to use the pnpm adapter: `scalp ci --pm pnpm`
+    </Info>
+  </Step>
+
+  <Step title="Read the CI report">
+    Open `.scalp/ci-report.json` to see what was verified:
+
+    ```json
+    {
+      "version": "0.2",
+      "passed": true,
+      "audit": {
+        "verified": 142,
+        "mismatched": 0,
+        "missing": 0
+      }
+    }
+    ```
+
+    `verified: 142` means 142 package directories were hashed and their hashes recorded in `.scalp/lockfile.json`. `mismatched: 0` confirms that every package on disk matches what was installed — nothing has been tampered with.
+
+    To write the report to a custom path, use `--output`:
+
+    ```bash
+    scalp ci --output ci-report.json
+    ```
+  </Step>
+
+  <Step title="Explore the .scalp directory">
+    After the first run, your project directory contains a new `.scalp/` folder:
+
+    ```
+    my-project/
+    ├── .scalp/
+    │   ├── policy.json          ← your policy (create this)
+    │   ├── policy.schema.json   ← JSON Schema for editor autocomplete
+    │   ├── lockfile.json        ← auto-generated: SHA-512 hashes of packages
+    │   ├── ci-report.json       ← CI report from last run
+    │   ├── cache/
+    │   │   └── trust.json       ← cached download counts and CVEs
+    │   └── audit.log            ← every event, append-only
+    ├── node_modules/
+    ├── package.json
+    └── package-lock.json
+    ```
+
+    - **`lockfile.json`** — SHA-512 hashes of every package directory. Auto-generated after install and used by `scalp audit` to detect tampering.
+    - **`audit.log`** — NDJSON append-only log. Every install, audit, and verify writes events here.
+    - **`cache/trust.json`** — Cached npm download counts and CVE lookups. SCAL-P uses this to avoid unnecessary network calls.
+    - **`policy.schema.json`** — Draft 2020-12 JSON Schema for `policy.json`. Editors that support `$schema` provide autocomplete automatically.
+
+    <Note>
+      Do not commit `.scalp/lockfile.json`, `.scalp/cache/`, or `.scalp/audit.log` to version control — these are local runtime state. Commit only `.scalp/policy.json` and `.scalp/policy.schema.json`.
+    </Note>
+  </Step>
+
+  <Step title="Add a policy">
+    Create `.scalp/policy.json` to start scoring packages:
+
+    ```json
+    {
+      "version": 1,
+      "trust": { "min_score": 60 },
+      "enforcement": { "on_violation": "warn" }
+    }
+    ```
+
+    Run `scalp ci` again:
+
+    ```bash
+    scalp ci
+    ```
+
+    Now every package is evaluated against the trust score engine. Each package receives a score from 0 to 80 based on four factors: hash verification (30 points), version maturity — `>= 1.0.0` (15 points), weekly npm downloads (0–20 points), and no active CVEs (0 or 15 points). Any package scoring below 60 is reported.
+
+    With `on_violation: warn`, violations are printed but do not block the install. You can review them before tightening enforcement.
+
+    <Note>
+      Trust scoring is offline-first. If SCAL-P cannot reach the npm registry for download stats, it awards half the points for that factor rather than failing the build.
+    </Note>
+  </Step>
+
+  <Step title="Enforce in CI">
+    When you're ready to block on violations, update the enforcement mode:
+
+    ```json
+    {
+      "version": 1,
+      "trust": { "min_score": 60 },
+      "enforcement": { "on_violation": "block" }
+    }
+    ```
+
+    Now `scalp ci` exits 1 on any violation — suitable for CI pipelines. For fork pull requests, use the `--pr-context fork` flag to force `require_hash` and block all install scripts:
+
+    ```bash
+    scalp ci --pr-context fork --output ci-report.json
+    ```
+
+    | Flag | Effect |
+    |------|--------|
+    | `--pr-context fork` (default) | Forces `require_hash`, blocks install scripts |
+    | `--pr-context internal` | Respects policy, scripts blocked unless `--allow-scripts` |
+    | `--output` | Path to JSON report (default `.scalp/ci-report.json`) |
+  </Step>
+</Steps>
+
+## What to explore next
+
+<CardGroup cols={2}>
+  <Card title="Commands" icon="terminal" href="/commands/install">
+    Full reference for `install`, `audit`, `ci`, `policy check`, `verify`, and `checksum`.
+  </Card>
+  <Card title="Policy configuration" icon="shield-check" href="/configuration/policy">
+    Allowlists, denylists, transitive depth limits, and the full policy schema.
+  </Card>
+  <Card title="Trust scoring" icon="star" href="/configuration/trust-score">
+    How the 0–80 score is calculated and how to set `min_score` for your risk tolerance.
+  </Card>
+  <Card title="CI integration" icon="circle-check" href="/guides/ci-integration">
+    Set up SCAL-P in GitHub Actions or any CI system that reads exit codes.
+  </Card>
+</CardGroup>

@@ -1,0 +1,94 @@
+---
+title: "scalp policy check: Evaluate policy without installing"
+description: "Resolve your dependency graph and evaluate every package against your policy and trust scores without installing anything or modifying node_modules."
+---
+
+`scalp policy check` is a dry-run policy evaluation. It resolves your project's dependencies from the lockfile, evaluates every package against your allow/deny rules and trust score settings, and reports any violations — without installing, modifying `node_modules`, or writing to `.scalp/lockfile.json`. Use it to validate a policy change, preview the impact of a new dependency, or confirm that your current lockfile would pass enforcement before committing.
+
+## Synopsis
+
+```bash
+scalp policy check [--policy <file>] [--pm npm|pnpm] [--ci]
+```
+
+## Flags
+
+<ParamField path="--policy" type="string" default=".scalp/policy.json">
+  Path to the policy file to evaluate. If the file does not exist, SCAL-P logs a warning and evaluates with default permissive settings — nothing is blocked.
+</ParamField>
+
+<ParamField path="--pm" type="string" default="npm">
+  Package manager to use for dependency resolution and lockfile parsing. Accepted values: `npm`, `pnpm`.
+</ParamField>
+
+<ParamField path="--ci" type="boolean" default="false">
+  Override enforcement to `block` regardless of `on_violation` in your policy. Use this to ensure a non-zero exit code on any violation in automated pipelines.
+</ParamField>
+
+## How it works
+
+<Steps>
+  <Step title="Load policy">
+    Reads the policy file from `--policy`. If the file is absent, SCAL-P proceeds with default settings and logs a warning.
+  </Step>
+  <Step title="Resolve dependencies">
+    Runs the package manager's lockfile-only resolution (equivalent to `npm install --package-lock-only`). This updates the lockfile without touching `node_modules`.
+  </Step>
+  <Step title="Parse lockfile">
+    Reads every dependency node from the resolved lockfile — name, version, resolved URL, and integrity hash.
+  </Step>
+  <Step title="Evaluate policy rules">
+    Checks each package against the allow/deny rules in your policy: trust mode (allowlist, denylist, audit-only), blocked patterns, and required properties.
+  </Step>
+  <Step title="Evaluate trust scores">
+    If `trust.min_score > 0` or `trust.require_hash` is set in your policy, scores each package and appends any below-threshold violations to the result.
+  </Step>
+  <Step title="Report and enforce">
+    If violations exist, applies the configured enforcement. With `--ci` or `on_violation: block`, exits 1. With `warn`, prints violations and exits 0. If no violations exist, logs `policy check ok` and exits 0.
+  </Step>
+</Steps>
+
+<Note>
+  `scalp policy check` does not write to `.scalp/audit.log`. It is a read-only inspection of your current policy and lockfile state.
+</Note>
+
+## Examples
+
+```bash
+# Check policy using default policy file and npm
+scalp policy check
+```
+
+```bash
+# Check against a different policy file
+scalp policy check --policy .scalp/strict-policy.json
+```
+
+```bash
+# Check with pnpm and block on any violation
+scalp policy check --pm pnpm --ci
+```
+
+```bash
+# Preview impact before adding a dependency
+npm install some-new-package --package-lock-only
+scalp policy check
+```
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | No violations found, or violations found with `warn`/`log` enforcement. |
+| `1` | Violations found and enforcement is `block` (via policy or `--ci` flag). |
+
+## What it does not do
+
+- Does not install or modify `node_modules`.
+- Does not update `.scalp/lockfile.json`.
+- Does not write audit events.
+- Does not publish or transmit any data.
+
+<Tip>
+  Run `scalp policy check` before `scalp install --guarded` when iterating on policy changes. It resolves faster than a full install and gives you immediate feedback on which packages would be blocked.
+</Tip>

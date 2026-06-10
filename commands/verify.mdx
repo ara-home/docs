@@ -1,0 +1,164 @@
+---
+title: "scalp verify: Verify release artifact SHA-512 integrity"
+description: "Compute the SHA-512 hash of a downloaded release artifact, compare it against a checksums file, log a binary_verify audit event, and enforce on mismatch."
+---
+
+`scalp verify` applies the same hashing and policy enforcement engine that SCAL-P uses for npm packages to binary release artifacts. You point it at a downloaded file and a checksums file, and it tells you whether the artifact is what it claims to be. The result — verified or mismatch — is always recorded as a `binary_verify` event in `.scalp/audit.log`. This makes `scalp verify` useful both for verifying SCAL-P's own releases and for any other release artifact in your pipeline.
+
+## Synopsis
+
+```bash
+scalp verify --artifact <file> --checksum <file> [--policy <file>] [--ci]
+```
+
+## Flags
+
+<ParamField path="--artifact" type="string" required>
+  Path to the release artifact file to verify. Only the base filename (not the full path) is used when looking up the expected hash in the checksums file.
+</ParamField>
+
+<ParamField path="--checksum" type="string" required>
+  Path to the checksums file. Each non-empty, non-comment line must follow the format `<hash>  <filename>` (two spaces between hash and filename). Lines beginning with `#` are skipped.
+</ParamField>
+
+<ParamField path="--policy" type="string" default=".scalp/policy.json">
+  Path to the policy file. The policy's `on_violation` setting controls what happens when a hash mismatch is detected. If the file is absent, SCAL-P defaults to `warn` enforcement.
+</ParamField>
+
+<ParamField path="--ci" type="boolean" default="false">
+  Override enforcement to `block` regardless of `on_violation` in your policy. With this flag, a hash mismatch always exits 1.
+</ParamField>
+
+## How it works
+
+<Steps>
+  <Step title="Load policy">
+    Reads the policy file to determine `on_violation` enforcement. If the file is missing, logs a warning and defaults to `warn`.
+  </Step>
+  <Step title="Parse checksums file">
+    Reads the checksums file line by line. Blank lines and lines starting with `#` are skipped. Each valid line is parsed as `<hash>  <filename>` (two-space delimiter).
+  </Step>
+  <Step title="Look up artifact">
+    Extracts the base filename from `--artifact` and looks it up in the parsed checksums map. If the filename is not found, the command exits with an error.
+  </Step>
+  <Step title="Hash the artifact">
+    Computes the SHA-512 hash of the artifact file using the same `hash.File` function used for npm packages.
+  </Step>
+  <Step title="Compare hashes">
+    Compares the computed hash against the expected hash from the checksums file. The result is either `verified` or `mismatch`.
+  </Step>
+  <Step title="Log audit event">
+    Appends a `binary_verify` event to `.scalp/audit.log` with the artifact filename, status, and hash match result.
+  </Step>
+  <Step title="Enforce on mismatch">
+    If hashes match, exits 0. If they do not match, applies `on_violation` from policy (or `block` if `--ci` was passed).
+  </Step>
+</Steps>
+
+## Checksums file format
+
+The checksums file uses the same two-field format produced by `scalp checksum`:
+
+```text
+sha512-a1b2c3d4e5f6...  scalp_linux_amd64.tar.gz
+sha512-e5f6g7h8i9j0...  scalp_darwin_amd64.tar.gz
+# Comments are ignored
+```
+
+Each line: `<sha512-hash>  <filename>` — two spaces separate the hash from the filename.
+
+## Enforcement behavior
+
+The `--policy` file's `on_violation` field controls what happens when the computed hash does not match the expected hash.
+
+| Enforcement | Hash match | Hash mismatch |
+|-------------|-----------|---------------|
+| `warn` (default) | Exit 0 | Logged to audit, exit 0 |
+| `block` | Exit 0 | Exit 1 |
+| `log` | Exit 0 | Silent, exit 0 |
+
+With `--ci`, enforcement is always `block` regardless of policy.
+
+## Audit event
+
+Every `scalp verify` call produces exactly one audit event appended to `.scalp/audit.log`:
+
+```json
+{
+  "ts": "2026-05-13T12:00:00Z",
+  "event": "binary_verify",
+  "pkg": "scalp_linux_amd64.tar.gz",
+  "status": "verified",
+  "hash_match": true
+}
+```
+
+`status` is `"verified"` on a successful match and `"mismatch"` on failure. `hash_match` is a boolean.
+
+## Examples
+
+```bash
+# Verify a downloaded artifact
+scalp verify \
+  --artifact scalp_linux_amd64.tar.gz \
+  --checksum checksums.txt
+```
+
+```bash
+# Block on mismatch (CI usage)
+scalp verify \
+  --artifact scalp_linux_amd64.tar.gz \
+  --checksum checksums.txt \
+  --ci
+```
+
+```bash
+# Use a non-default policy file
+scalp verify \
+  --artifact scalp_linux_amd64.tar.gz \
+  --checksum checksums.txt \
+  --policy .scalp/release-policy.json
+```
+
+### Release pipeline example
+
+<CodeGroup>
+
+```yaml Generate checksums during release
+# Generate checksums and upload alongside artifacts
+- run: scalp checksum scalp_*.tar.gz > checksums.txt
+
+- run: |
+    gh release create v0.2.0 \
+      scalp_linux_amd64.tar.gz \
+      scalp_darwin_amd64.tar.gz \
+      checksums.txt
+```
+
+```yaml Verify after download
+# Download and verify before using the binary
+- run: |
+    scalp verify \
+      --artifact scalp_linux_amd64.tar.gz \
+      --checksum checksums.txt \
+      --ci
+```
+
+</CodeGroup>
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Hash verified — artifact matches the checksums file. |
+| `1` | Hash mismatch and enforcement is `block`, the checksums file was not found, or the artifact filename was not found in the checksums file. |
+
+## What it does not do
+
+- Does not verify the authenticity of the checksums file itself (use GPG signing or HTTPS separately).
+- Does not support wildcards in `--artifact` — one file per invocation.
+- Does not scan the artifact for malware.
+
+<Tip>
+  Pair `scalp verify` with `scalp checksum` to build a complete release integrity chain. Generate checksums during your release pipeline and distribute them alongside your artifacts so users can verify downloads.
+</Tip>

@@ -1,0 +1,87 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "SCAL-P",
+  "projectDescription": "A Go CLI tool that wraps npm and pnpm to enforce dependency policies, verify integrity via SHA-512 hashing, and log every install as a security checkpoint between your project and the npm ecosystem.",
+  "theme": "aspen",
+  "primaryColor": "#1A7A6E",
+  "lightColor": "#E8F5F3",
+  "darkColor": "#0D4A44",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Commands",
+            "pages": [
+              "commands/install",
+              "commands/audit",
+              "commands/ci",
+              "commands/policy-check",
+              "commands/verify",
+              "commands/checksum"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/policy",
+              "configuration/trust-score",
+              "configuration/package-managers"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/ci-integration",
+              "guides/binary-verify",
+              "guides/architecture"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/policy-schema",
+              "reference/audit-log",
+              "reference/lockfile",
+              "reference/troubleshooting"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Policy enforcement with allowlist, denylist, and audit-only modes",
+    "SHA-512 integrity hashing of installed packages via .scalp/lockfile.json",
+    "Trust scoring (0-80) based on hash verification, version maturity, download popularity, and CVE status",
+    "Single-command CI mode (scalp ci) with structured JSON reports and exit codes",
+    "npm and pnpm support via a unified PackageManager interface",
+    "Binary self-verification via scalp checksum and scalp verify (dogfooding)",
+    "Append-only NDJSON audit log for every install, audit, and verify event",
+    "Offline-first design: network failure degrades gracefully (half points, not zero)",
+    "Zero external Go dependencies — stdlib only"
+  ],
+  "publicApiSurface": [
+    "scalp install [--guarded] [--pm npm|pnpm]",
+    "scalp audit [--pm npm|pnpm]",
+    "scalp ci [--pr-context fork|internal] [--output <file>] [--allow-scripts]",
+    "scalp policy check",
+    "scalp verify --artifact <file> --checksum <file> [--ci]",
+    "scalp checksum [--output <file>] <files...>",
+    "scalp version",
+    ".scalp/policy.json (policy configuration file)",
+    ".scalp/lockfile.json (auto-generated SHA-512 hash store)",
+    ".scalp/audit.log (NDJSON append-only event log)",
+    ".scalp/ci-report.json (structured CI report)",
+    ".scalp/cache/trust.json (trust score cache, TTL 7 days)"
+  ]
+}

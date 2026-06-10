@@ -1,0 +1,306 @@
+---
+title: "SCAL-P policy.json: complete configuration reference"
+description: "Complete field-by-field reference for .scalp/policy.json — covering trust modes, allow/deny rules, transitive depth limits, and enforcement behavior."
+---
+
+SCAL-P reads its rules from `.scalp/policy.json` at the root of your project. Every field has a default, so an empty file or a missing file produces the same permissive baseline: `audit-only` mode, warn on violations, passthrough installs. You only need to set the fields you want to change.
+
+The schema is plain JSON — no YAML, no TOML. If you know the Go struct layout in `internal/policy/policy.go`, you already know the schema.
+
+<Note>
+Add `"$schema": ".scalp/policy.schema.json"` (or the raw GitHub URL) as the first field in your `policy.json`. VS Code, JetBrains IDEs, and any editor with JSON Schema support will give you autocomplete, inline documentation, and validation for free. The schema targets JSON Schema Draft 2020-12.
+</Note>
+
+## Complete default schema
+
+```json policy.json
+{
+  "$schema": ".scalp/policy.schema.json",
+  "version": 1,
+  "trust": {
+    "mode": "audit-only",
+    "min_score": 0,
+    "require_hash": false
+  },
+  "packages": {
+    "allow": [],
+    "deny": []
+  },
+  "transitive": {
+    "max_depth": 0
+  },
+  "enforcement": {
+    "on_violation": "warn",
+    "default_mode": "passthrough"
+  }
+}
+```
+
+All values above are the defaults. A file containing only `{"version": 1}` behaves identically.
+
+---
+
+## Top-level fields
+
+<ParamField path="version" type="integer" required default="1">
+  Policy schema version. Currently the only valid value is `1`. If omitted, SCAL-P defaults to `1`. Future schema versions will define explicit migration paths.
+</ParamField>
+
+<ParamField path="trust" type="object">
+  Controls which packages are permitted and how trust scoring operates. All sub-fields have safe defaults. See the [`trust`](#trust) section below.
+</ParamField>
+
+<ParamField path="packages" type="object">
+  Contains `allow` and `deny` arrays of `PackageRule` objects. Only consulted when `trust.mode` is `allowlist` or `denylist`. See [`packages`](#packages) below.
+</ParamField>
+
+<ParamField path="transitive" type="object">
+  Limits on indirect dependency nesting depth. See [`transitive`](#transitive) below.
+</ParamField>
+
+<ParamField path="enforcement" type="object">
+  Controls what happens when a violation is detected — whether SCAL-P blocks, warns, or silently logs. See [`enforcement`](#enforcement) below.
+</ParamField>
+
+---
+
+## `trust`
+
+The `trust` object controls the selection mode and numeric risk scoring applied to every dependency.
+
+<ParamField path="trust.mode" type="string" default="audit-only">
+  Package selection strategy. Accepted values:
+
+  | Value | Behavior |
+  |-------|----------|
+  | `audit-only` | Log everything. Never block based on trust rules. |
+  | `allowlist` | Only packages matching an entry in `packages.allow` are permitted. Everything else is a violation. |
+  | `denylist` | Packages matching an entry in `packages.deny` are blocked. Everything else is allowed. |
+</ParamField>
+
+<ParamField path="trust.min_score" type="integer" default="0">
+  Minimum trust score threshold, from `0` to `80`. Every resolved dependency receives a score computed from four factors (hash, version maturity, download popularity, CVE status). Packages scoring below `min_score` trigger a violation.
+
+  Set to `0` (the default) to disable trust scoring entirely. This is useful during initial migration or when you want allow/deny logic without numeric risk gating. See [trust score](/configuration/trust-score) for the full scoring breakdown.
+</ParamField>
+
+<ParamField path="trust.require_hash" type="boolean" default="false">
+  When `true`, any package whose integrity hash is absent from `.scalp/lockfile.json` is an **automatic violation** — regardless of its trust score. This is your supply-chain minimum: if a package was installed outside SCAL-P's guarded flow, or if the lockfile was edited after the fact, you know immediately.
+
+  `require_hash` and `min_score` are enforced independently. A package can fail either check or both:
+
+  | Package state | Result |
+  |--------------|--------|
+  | Missing hash | Violation: `hash_required` |
+  | Has hash, score below `min_score` | Violation: `trust_score_too_low` |
+  | Has hash, score at or above `min_score` | Passes |
+</ParamField>
+
+---
+
+## `packages`
+
+The `packages` object holds two arrays of `PackageRule` entries. Which array is active depends on `trust.mode`.
+
+<ParamField path="packages.allow" type="PackageRule[]" default="[]">
+  List of permitted packages, consulted only in `allowlist` mode. An empty array blocks every package — be sure to populate it before switching to `allowlist` mode.
+</ParamField>
+
+<ParamField path="packages.deny" type="PackageRule[]" default="[]">
+  List of blocked packages, consulted only in `denylist` mode. An empty array allows everything (no-op deny list).
+</ParamField>
+
+### PackageRule structure
+
+Each entry in `allow` or `deny` is a `PackageRule` object. At least one of `name` or `pattern` is required per rule. Both may be present.
+
+<ParamField path="name" type="string">
+  Exact package name match. Case-insensitive. Use the full scoped name for scoped packages.
+
+  Examples: `"lodash"`, `"@scope/package"`
+</ParamField>
+
+<ParamField path="pattern" type="string">
+  Glob-style pattern match against the package name. Supports the following forms:
+
+  | Pattern | What it matches |
+  |---------|----------------|
+  | `*` | Everything |
+  | `prefix*` | Any name starting with `prefix` |
+  | `*suffix` | Any name ending with `suffix` |
+  | `*substr*` | Any name containing `substr` |
+  | `@scope/*` | All packages under `@scope/` |
+
+  Examples: `"*-free"`, `"@evil-scope/*"`, `"*debug*"`
+</ParamField>
+
+<ParamField path="versions" type="string">
+  Optional semver constraint. When present, a package only matches the rule if its resolved version satisfies the range.
+
+  Examples: `"^4.0.0"`, `">=1.0.0"`, `"<2.0.0"`
+</ParamField>
+
+<ParamField path="checksum" type="string">
+  Optional expected SHA-512 integrity hash in `sha512-<base64>` format. When present, the package must match exactly.
+
+  Example: `"sha512-a1b2c3d4..."`
+</ParamField>
+
+```json example PackageRule entries
+{
+  "packages": {
+    "deny": [
+      { "name": "malicious-pkg" },
+      { "pattern": "*-free" },
+      { "name": "old-lib", "versions": "<2.0.0" },
+      { "pattern": "@evil-scope/*" }
+    ]
+  }
+}
+```
+
+---
+
+## `transitive`
+
+<ParamField path="transitive.max_depth" type="integer" default="0">
+  Maximum allowed nesting depth for transitive (indirect) dependencies. `0` means no limit.
+
+  Depth is defined as the number of edges from the root project to the package: depth `0` is the root, depth `1` is a direct dependency, depth `2` is a dependency of a dependency, and so on.
+
+  When a package is found at a depth greater than `max_depth`, a `transitive_depth_exceeded` violation is raised.
+
+  ```json
+  { "transitive": { "max_depth": 5 } }
+  ```
+
+  Deep trees are harder to audit and more likely to contain packages that no one on your team deliberately chose. Use this field as a heuristic guardrail, not as a security guarantee.
+</ParamField>
+
+---
+
+## `enforcement`
+
+The `enforcement` object controls what SCAL-P does when any violation is detected — whether from trust mode, trust scoring, or depth limits.
+
+<ParamField path="enforcement.on_violation" type="string" default="warn">
+  Action to take when a package violates policy. Accepted values:
+
+  | Value | Behavior |
+  |-------|----------|
+  | `warn` | Print violations to stderr. Continue with exit code 0. |
+  | `block` | Print violations. Exit with code 1. Install is skipped in guarded mode. |
+  | `log` | Silently append to `.scalp/audit.log`. Continue with exit code 0. |
+
+  <Warning>
+    The `--ci` flag overrides `on_violation` to `block` unconditionally, regardless of what is set here. CI mode always exits 1 on any violation.
+  </Warning>
+</ParamField>
+
+<ParamField path="enforcement.default_mode" type="string" default="passthrough">
+  The install mode used when the `--guarded` flag is not passed on the command line. Accepted values:
+
+  | Value | Behavior |
+  |-------|----------|
+  | `passthrough` | Run the install without policy evaluation. Sync lockfile hashes after install. |
+  | `guarded` | Always evaluate policy before install, even without `--guarded`. |
+
+  Use `guarded` in environments where you never want unguarded installs. Use `passthrough` (the default) to opt into guarded mode on a per-run basis with the `--guarded` flag.
+</ParamField>
+
+---
+
+## Example configurations
+
+<Tabs>
+  <Tab title="Minimal">
+    Trust scoring only, with a warn-on-violation policy. Safe for teams adopting SCAL-P incrementally — you get visibility into risk without blocking installs.
+
+    ```json policy.json
+    {
+      "version": 1,
+      "trust": {
+        "min_score": 60
+      },
+      "enforcement": {
+        "on_violation": "warn"
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Locked down">
+    Strict allowlist with hash requirement and block-on-violation. Appropriate for production environments or regulated projects where every dependency must be explicitly approved.
+
+    ```json policy.json
+    {
+      "version": 1,
+      "trust": {
+        "mode": "allowlist",
+        "min_score": 60,
+        "require_hash": true
+      },
+      "packages": {
+        "allow": [
+          { "name": "lodash", "versions": "^4.0.0" },
+          { "name": "express", "versions": "^4.18.0" }
+        ]
+      },
+      "transitive": {
+        "max_depth": 5
+      },
+      "enforcement": {
+        "on_violation": "block",
+        "default_mode": "guarded"
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="CI pipeline">
+    Denylist combined with a trust score floor. Blocks known bad patterns and packages with low popularity or active CVEs. Suitable for CI pipelines where you want to catch regressions without maintaining an explicit allowlist.
+
+    ```json policy.json
+    {
+      "version": 1,
+      "trust": {
+        "min_score": 50
+      },
+      "packages": {
+        "deny": [
+          { "pattern": "*-free" },
+          { "pattern": "*debug*" }
+        ]
+      },
+      "enforcement": {
+        "on_violation": "block",
+        "default_mode": "passthrough"
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Editor autocomplete with JSON Schema
+
+SCAL-P ships a JSON Schema file at `.scalp/policy.schema.json` (Draft 2020-12). Adding the `$schema` field to your `policy.json` enables full autocomplete and inline validation in VS Code, JetBrains IDEs, and any other editor with JSON Language Server support.
+
+```json policy.json
+{
+  "$schema": ".scalp/policy.schema.json",
+  "version": 1
+}
+```
+
+You can also reference the hosted schema directly:
+
+```json policy.json
+{
+  "$schema": "https://raw.githubusercontent.com/CarlosEduJs/SCAL-P/main/.scalp/policy.schema.json",
+  "version": 1
+}
+```
+
+<Tip>
+  The local path form (`".scalp/policy.schema.json"`) works without internet access and reflects any schema changes you make locally during development.
+</Tip>

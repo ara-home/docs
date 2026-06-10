@@ -1,0 +1,140 @@
+---
+title: "Audit log reference: .scalp/audit.log event format"
+description: "Structured NDJSON event log written by every install, audit, and verify operation — field definitions, event types, and example entries."
+---
+
+Every SCAL-P command that touches packages writes structured events to `.scalp/audit.log`. The file is append-only NDJSON (newline-delimited JSON): one JSON object per line, never overwritten. This makes it easy to stream into log aggregators, `grep` for specific events, or archive per-deployment. Because it accumulates over time and may contain sensitive package names, do not commit it to version control.
+
+<Warning>
+Do not commit `.scalp/audit.log` to version control. Add it to `.gitignore` alongside `.scalp/lockfile.json` and `.scalp/cache/`. The log grows unboundedly and can expose internal dependency details.
+</Warning>
+
+## Event structure
+
+Every line in the log is a JSON object with the following fields, as defined in `internal/audit/logger.go`:
+
+<ResponseField name="ts" type="string" required>
+  RFC 3339 UTC timestamp of when the event was written. Example: `"2026-05-17T14:32:01Z"`.
+</ResponseField>
+
+<ResponseField name="event" type="string" required>
+  Event type identifier. See [Event types](#event-types) for all possible values.
+</ResponseField>
+
+<ResponseField name="pkg" type="string">
+  The affected package in `name@version` format. Omitted for events that do not relate to a specific package (such as `policy_missing`).
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Outcome of the event. Common values:
+
+  | Value | Meaning |
+  |---|---|
+  | `"verified"` | Hash matched or binary confirmed clean. |
+  | `"blocked"` | Package was blocked due to a policy or trust violation. |
+  | `"warn"` | Event recorded but execution continued. |
+  | `"mismatch"` | Computed hash did not match the stored lockfile entry. |
+  | `"missing"` | Package directory is absent from `node_modules`. |
+</ResponseField>
+
+<ResponseField name="reason" type="string">
+  Machine-readable explanation of why the event occurred. Present on violations and warnings. See [Event types](#event-types) for reason values per event type.
+</ResponseField>
+
+<ResponseField name="rule" type="string">
+  The policy rule that triggered this event, such as `"allowlist"`, `"denylist"`, `"lockfile"`, or `"binary_verify"`. Present on policy and lockfile violation events.
+</ResponseField>
+
+<ResponseField name="hash_match" type="boolean">
+  `true` when the computed hash matched the stored entry. `false` (or absent) otherwise. Present on `hash_verified`, `hash_check`, and `binary_verify` events.
+</ResponseField>
+
+## Event types
+
+### `policy_missing`
+
+Emitted when SCAL-P cannot find `.scalp/policy.json`. Execution continues with an audit-only, non-blocking posture.
+
+```json
+{"ts":"2026-05-17T14:32:01Z","event":"policy_missing","status":"warn","reason":"policy_not_found"}
+```
+
+### `policy_violation`
+
+One event per package that violates an `allowlist`, `denylist`, transitive depth, or trust score rule. The `reason` field carries the specific violation type such as `"trust_score_too_low"` or `"hash_required"`.
+
+```json
+{"ts":"2026-05-17T14:32:02Z","event":"policy_violation","pkg":"left-pad@1.3.0","status":"blocked","reason":"trust_score_too_low","rule":"trust"}
+```
+
+```json
+{"ts":"2026-05-17T14:32:02Z","event":"policy_violation","pkg":"evil-pkg@0.1.0","status":"blocked","reason":"denylist","rule":"denylist"}
+```
+
+### `hash_verified`
+
+Emitted by `SyncWithTree` after a successful SHA-512 hash of a package directory. One event per package after every guarded install or `scalp ci` run.
+
+```json
+{"ts":"2026-05-17T14:32:05Z","event":"hash_verified","pkg":"lodash@4.17.21","status":"verified","hash_match":true}
+```
+
+### `hash_skipped`
+
+Emitted when the package directory cannot be located on disk during a sync. The package is omitted from the lockfile for this run.
+
+```json
+{"ts":"2026-05-17T14:32:05Z","event":"hash_skipped","pkg":"lightningcss-android-arm64@1.28.2","status":"warn","reason":"package_dir_not_found"}
+```
+
+### `hash_check`
+
+Emitted by `VerifyAgainstTree` (run during `scalp audit` and `scalp ci`) for every package in the dependency tree. `hash_match` is `true` when the recomputed hash equals the stored lockfile entry.
+
+```json
+{"ts":"2026-05-17T14:32:08Z","event":"hash_check","pkg":"express@4.18.2","status":"verified","hash_match":true}
+```
+
+```json
+{"ts":"2026-05-17T14:32:08Z","event":"hash_check","pkg":"express@4.18.2","status":"mismatch"}
+```
+
+```json
+{"ts":"2026-05-17T14:32:08Z","event":"hash_check","pkg":"express@4.18.2","status":"missing","reason":"package_not_installed"}
+```
+
+### `hash_missing`
+
+Emitted when `VerifyAgainstTree` finds a package in the dependency tree that has no entry in `.scalp/lockfile.json`. This means the package was not installed through SCAL-P's guarded flow.
+
+```json
+{"ts":"2026-05-17T14:32:08Z","event":"hash_missing","pkg":"some-new-dep@2.0.0","status":"warn","reason":"missing_lock_entry"}
+```
+
+### `binary_verify`
+
+Emitted by `scalp verify`. Compares the SHA-512 of a release artifact against a checksums file.
+
+```json
+{"ts":"2026-05-17T14:32:10Z","event":"binary_verify","pkg":"scalp_linux_amd64.tar.gz","status":"verified","hash_match":true}
+```
+
+```json
+{"ts":"2026-05-17T14:32:10Z","event":"binary_verify","pkg":"scalp_linux_amd64.tar.gz","status":"mismatch"}
+```
+
+## How events are produced
+
+| Command | Events written |
+|---|---|
+| `scalp install` (passthrough) | `hash_verified`, `hash_skipped` |
+| `scalp install --guarded` | `policy_missing` (if no policy), `policy_violation` (if violations), `hash_verified`, `hash_skipped` |
+| `scalp audit` | `hash_check`, `hash_missing` |
+| `scalp ci` | `policy_violation` (if pre-install violations), `hash_verified`, `hash_skipped`, `hash_check`, `hash_missing` |
+| `scalp verify` | `binary_verify` |
+
+The logger (`internal/audit/logger.go`) opens the file in append mode on every call and closes it immediately after writing the batch. No file handle is held between commands — the file is always safe to read or rotate externally.
+
+<Note>
+Events are written even when the `on_violation` enforcement mode is `warn` or `log`. The audit log is a record of what happened, not a reflection of what was blocked.
+</Note>

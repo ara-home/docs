@@ -1,0 +1,281 @@
+---
+title: "SCAL-P internals: data flow, adapters, and constraints"
+description: "How SCAL-P works internally — the 10-step guarded install flow, package manager adapter pattern, trust score pipeline, and key design constraints."
+---
+
+SCAL-P is not a daemon, not a proxy, and not a plugin. It is a CLI tool that wraps npm and pnpm. Every invocation is stateless: load policy, resolve, evaluate, act, log, exit. This page describes the internal architecture for contributors and advanced users who want to understand how the pieces fit together — from the moment you run `scalp install --guarded` to the final line written to `.scalp/audit.log`.
+
+## Data flow: guarded install
+
+The following diagram shows the full data flow for `scalp install --guarded`. Each step maps to a specific internal package.
+
+```
+CLI (scalp install --guarded)
+│
+├─ 1. Load policy ─────────────────────── internal/policy/
+│    │  .scalp/policy.json
+│    │  default if missing
+│    └─> Policy struct
+│
+├─ 2. Resolve ─────────────────────────── internal/npm/ or internal/pnpm/
+│    │  npm install --package-lock-only
+│    │  pnpm install --lockfile-only
+│    └─> package-lock.json / pnpm-lock.yaml
+│
+├─ 3. Parse lockfile ──────────────────── internal/pkgmanager/
+│    │  adapter.ParseLockfile(ctx)
+│    │  npm: reads package-lock.json
+│    │  pnpm: reads pnpm-lock.yaml
+│    └─> []PackageNode
+│
+├─ 4. Evaluate policy ─────────────────── internal/policy/
+│    │  policy.Evaluate(pol, nodes)
+│    │  allowlist / denylist / audit-only
+│    │  transitive max_depth
+│    └─> []Violation
+│
+├─ 5. Evaluate trust score ────────────── internal/trust/
+│    │  scorer.Evaluate(pol, nodes, lockfile)
+│    │  4 factors: hash, maturity, downloads, CVEs
+│    │  cache: .scalp/cache/trust.json
+│    │  npm API: api.npmjs.org (degraded offline)
+│    └─> []Violation (appended to policy violations)
+│
+├─ 6. Enforce ─────────────────────────── internal/policy/
+│    │  ApplyEnforcement(mode, violations)
+│    │  block → exit 1
+│    │  warn  → log + continue
+│    │  log   → silent
+│    └─> audit events logged
+│
+├─ 7. Install ─────────────────────────── internal/npm/ or internal/pnpm/
+│    │  npm install / pnpm install
+│    │  --ignore-scripts in CI/fork context
+│    └─> node_modules/ populated
+│
+├─ 8. Get dependency tree ─────────────── internal/pkgmanager/
+│    │  adapter.GetTree(ctx)
+│    │  npm ls --all --json
+│    │  pnpm ls --json --depth Infinity
+│    └─> DependencyTree
+│
+├─ 9. Hash sync ───────────────────────── internal/lockfile/
+│    │  SyncWithTree(ctx, lf, tree, pm)
+│    │  hash.Dir() for each package
+│    │  SHA-512 of every file in directory
+│    └─> .scalp/lockfile.json updated
+│
+└─ 10. Audit log ──────────────────────── internal/audit/
+     │  audit.Logger.Log(ctx, events)
+     │  NDJSON append-only
+     └─> .scalp/audit.log
+```
+
+## 10-step guarded install flow
+
+<Steps>
+  <Step title="Load policy">
+    SCAL-P reads `.scalp/policy.json` and deserializes it into a `Policy` struct (`internal/policy/`). If the file does not exist, safe defaults are used: `warn` enforcement, `audit-only` mode. No file means no hard blocks.
+  </Step>
+
+  <Step title="Resolve">
+    The package manager adapter is called with the lockfile-only flag (`npm install --package-lock-only` or `pnpm install --lockfile-only`). This produces or refreshes the lockfile without installing anything into `node_modules`.
+  </Step>
+
+  <Step title="Parse lockfile">
+    The adapter's `ParseLockfile(ctx)` method reads the lockfile produced in step 2 and returns a flat list of `PackageNode` structs — one per dependency, direct or transitive.
+  </Step>
+
+  <Step title="Evaluate policy">
+    `policy.Evaluate(pol, nodes)` checks every node against the allowlist, denylist, and `transitive.max_depth` setting. Violations are collected into a `[]Violation` slice.
+  </Step>
+
+  <Step title="Evaluate trust score">
+    `scorer.Evaluate(pol, nodes, lockfile)` runs the four-factor trust score for each package: hash verification (30 pts), version maturity (15 pts), weekly download count (0–20 pts), and CVE status (15 pts). The cache at `.scalp/cache/trust.json` is consulted first; the npm API is used as a fallback. Additional violations are appended to the slice from step 4.
+  </Step>
+
+  <Step title="Enforce">
+    `ApplyEnforcement(mode, violations)` applies the configured enforcement mode. `block` exits 1 immediately. `warn` prints violations and continues. `log` records them silently and continues. All violations are written as audit events regardless of mode.
+  </Step>
+
+  <Step title="Install">
+    If enforcement did not halt execution, the package manager installs dependencies. In CI and fork contexts, `--ignore-scripts` is passed to prevent lifecycle scripts from running.
+  </Step>
+
+  <Step title="Get dependency tree">
+    The adapter calls `GetTree(ctx)`, which runs `npm ls --all --json` or `pnpm ls --json --depth Infinity`. The result is a structured `DependencyTree` that maps package names to their on-disk locations.
+  </Step>
+
+  <Step title="Hash sync">
+    `SyncWithTree(ctx, lf, tree, pm)` walks every package in the tree, calls `hash.Dir()` on each directory to compute a SHA-512 hash of all files within it, and writes the results to `.scalp/lockfile.json`. This file is the baseline for all future audit checks.
+  </Step>
+
+  <Step title="Audit log">
+    `audit.Logger.Log(ctx, events)` appends all events produced during the run to `.scalp/audit.log` in NDJSON format. The log is append-only — nothing is overwritten.
+  </Step>
+</Steps>
+
+## Component diagram
+
+```
+┌─────────────┐
+│    CLI      │  internal/cli/ — command routing, flag parsing
+│  cli.go     │  install, audit, ci, verify, checksum
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐     ┌──────────────────┐
+│  pkgmanager │────▶│  npm / pnpm      │  adapter pattern
+│  interface  │     │  adapter         │  exec.CommandContext for PM
+└──────┬──────┘     └──────────────────┘
+       │
+       ▼
+┌─────────────┐     ┌──────────────────┐
+│  policy     │────▶│  policy.Evaluate │  allow/deny/transitive rules
+│  .json      │     │  trust.Evaluate  │  hash + maturity + downloads + CVEs
+└─────────────┘     └──────┬───────────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │  enforcement │  block / warn / log
+                    └──────┬───────┘
+                           │
+                           ▼ (if passed)
+                    ┌──────────────┐
+                    │  hash        │  hash.Dir() / hash.File()
+                    │  lockfile    │  .scalp/lockfile.json
+                    └──────┬───────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │  audit       │  NDJSON logger
+                    │  reporter    │  structured JSON (CI)
+                    └──────────────┘
+```
+
+## Package manager adapter pattern
+
+Every supported package manager implements the same `PackageManager` interface defined in `internal/pkgmanager/`:
+
+```
+PackageManager
+├── Name() string
+├── Resolve(ctx, args...) error
+├── ParseLockfile(ctx) ([]PackageNode, error)
+├── Install(ctx, args...) error
+├── GetTree(ctx) (DependencyTree, error)
+└── LocalPath(name) string
+```
+
+The registry in `internal/pkgmanager/registry.go` maps package manager names to their constructors. `cli.init()` calls the registry to select the adapter based on `--pm`. Currently implemented adapters are `npm` and `pnpm`.
+
+<Note>
+  To add support for a new package manager, implement the `PackageManager` interface in a new package and register it in the registry. No changes to the CLI or evaluation engine are required.
+</Note>
+
+## Trust score pipeline
+
+The trust score engine in `internal/trust/` runs a four-factor evaluation for each package:
+
+```
+scorer.Evaluate(ctx, policy, nodes, lockfile)
+│
+├─ Load cache (.scalp/cache/trust.json)
+├─ Fetch CVEs (npm audit --json OR injected mock)
+│
+├─ For each PackageNode:
+│  ├─ Hash verified?        → 30 or 0 pts
+│  ├─ Version >= 1.0.0?     → 15 or 0 pts
+│  ├─ Downloads (cache/API) → 0-20 pts (half if unknown)
+│  └─ CVEs (audit/cache)    → 15 or 0 pts (half if unknown)
+│  │   require_hash?        → hard violation if no hash
+│  └─ Score < min_score?    → violation
+│
+├─ Update cache
+└─ Save cache
+```
+
+<Note>
+  SCAL-P is offline-first. When the npm API is unreachable, download and CVE scores fall back to half-points rather than zero. A network failure degrades score accuracy but does not block evaluation or produce false violations.
+</Note>
+
+The cache at `.scalp/cache/trust.json` has a TTL of 7 days. Entries older than 7 days are re-fetched on the next run.
+
+## CI command flow
+
+`scalp ci` runs a variation of the guarded install flow optimized for pipeline use. It always blocks on violation, always writes a report, and never accepts passthrough arguments to the package manager:
+
+```
+scalp ci
+│
+├─ 1. Load policy
+├─ 2. Resolve (lockfile-only)
+├─ 3. Parse lockfile
+├─ 4. Evaluate policy + trust
+├─ 5. If violations → write report → exit 1 (never installs)
+├─ 6. Install (--ignore-scripts in fork context)
+├─ 7. Hash sync (hash.Dir → .scalp/lockfile.json)
+├─ 8. Verify against tree (detect tampering)
+├─ 9. Write report (.scalp/ci-report.json or stdout)
+└─ 10. Exit 0 if no violations, 1 otherwise
+```
+
+The report is always written — including when the command exits 1. CI systems can upload it as an artifact unconditionally.
+
+## File layout
+
+The `.scalp/` directory holds all SCAL-P state for a project:
+
+```
+.scalp/
+├── policy.json           ← your policy (checked in)
+├── policy.schema.json    ← JSON Schema (checked in)
+├── lockfile.json         ← auto-generated hashes
+├── ci-report.json        ← last CI run
+├── cache/
+│   └── trust.json        ← download counts, CVEs (TTL 7 days)
+└── audit.log             ← append-only event log
+```
+
+<Note>
+  Check in `policy.json` and `policy.schema.json`. Do not commit `lockfile.json`, `cache/`, or `audit.log` — these are local runtime state.
+</Note>
+
+## Internal package layout
+
+```
+cmd/scalp/main.go              # entrypoint → cli.Run()
+internal/
+├── cli/                       # command routing (install, audit, ci, verify, checksum)
+├── policy/                    # policy loading, evaluation, enforcement
+├── lockfile/                  # .scalp/lockfile.json management + hash verification
+├── hash/                      # SHA-512 hashing (directory + single file)
+├── trust/                     # trust score engine, cache, npm API client
+├── reporter/                  # structured JSON report for CI
+├── audit/                     # NDJSON audit logger
+├── ctxutil/                   # context helpers
+├── pkgmanager/                # PackageManager interface + registry
+├── npm/                       # npm adapter
+├── pnpm/                      # pnpm adapter
+└── version/                   # build-time version injection
+```
+
+## Design constraints
+
+Four constraints shape every decision in SCAL-P's implementation:
+
+<Note>
+  **Zero external Go dependencies.** SCAL-P uses the Go standard library only — no framework, no SDK, no ORM. This keeps the supply chain for the tool itself minimal and auditable.
+</Note>
+
+<Note>
+  **No daemon.** Every invocation is stateless. SCAL-P starts, does its work, and exits. There is no background process, no socket, and no persistent state beyond the files in `.scalp/`.
+</Note>
+
+<Note>
+  **Offline-first.** The npm API is consulted only when the local cache is stale. Network failure degrades score accuracy but never prevents SCAL-P from running. All evaluation inputs are available locally.
+</Note>
+
+<Note>
+  **Deterministic.** Given the same policy file, lockfile, and cache state, SCAL-P produces the same output every time. There are no random seeds, no timestamps in scoring, and no environment-dependent branching in the evaluation engine.
+</Note>

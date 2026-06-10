@@ -1,0 +1,105 @@
+---
+title: "scalp audit: Verify node_modules integrity on disk"
+description: "Recompute SHA-512 hashes for every installed package and compare them against .scalp/lockfile.json to detect tampering, corruption, or missing packages."
+---
+
+`scalp audit` is a read-oriented integrity check. It does not install, modify, or remove anything. Instead, it walks your `node_modules` tree, recomputes SHA-512 hashes for each package directory, and compares them against the hashes recorded in `.scalp/lockfile.json`. Any package whose on-disk hash differs from the stored value — or that appears in one place but not the other — is reported as a violation.
+
+## Synopsis
+
+```bash
+scalp audit [--pm npm|pnpm] [--policy <file>] [--ci]
+```
+
+## Flags
+
+<ParamField path="--pm" type="string" default="npm">
+  Package manager whose dependency tree to read. Accepted values: `npm`, `pnpm`. SCAL-P uses the package manager's tree output to enumerate installed packages before hashing.
+</ParamField>
+
+<ParamField path="--policy" type="string" default=".scalp/policy.json">
+  Path to the policy file. The policy controls `on_violation` enforcement and trust score settings. If the file is absent, SCAL-P logs a `policy_missing` event and proceeds in warn-only mode.
+</ParamField>
+
+<ParamField path="--ci" type="boolean" default="false">
+  Override enforcement to `block` regardless of `on_violation` in your policy. Use this in pipelines where a hash mismatch must always fail the build.
+</ParamField>
+
+## What audit checks
+
+`scalp audit` performs two categories of verification for each package in the dependency tree:
+
+| Category | What it means |
+|----------|---------------|
+| **Verified** | The package is installed and its SHA-512 hash matches the entry in `.scalp/lockfile.json`. |
+| **Mismatched** | The package is installed but its hash differs from the lockfile entry. The package may have been tampered with or corrupted. |
+| **Missing** | The package appears in the dependency tree but has no entry in the lockfile, or is listed in the lockfile but absent from `node_modules`. |
+
+If `trust.min_score` or `trust.require_hash` are configured in your policy, audit also evaluates each package's trust score and appends any trust violations to the overall result.
+
+## How it works
+
+<Steps>
+  <Step title="Load lockfile">
+    Reads `.scalp/lockfile.json` — the hash database written by the last `scalp install` or `scalp ci` run.
+  </Step>
+  <Step title="Get dependency tree">
+    Asks the package manager for the full installed dependency tree.
+  </Step>
+  <Step title="Hash and compare">
+    For each package in the tree, recomputes the SHA-512 hash of its directory and compares it against the lockfile entry.
+  </Step>
+  <Step title="Evaluate trust scores">
+    If trust scoring is configured, runs the scorer against the installed packages and the lockfile, appending any score-based violations.
+  </Step>
+  <Step title="Log events">
+    Writes all audit events (verified, mismatched, missing) to `.scalp/audit.log` in NDJSON format.
+  </Step>
+  <Step title="Enforce violations">
+    If violations exist, applies `on_violation` from your policy (or `block` if `--ci` was passed). If none, logs `audit ok` and exits 0.
+  </Step>
+</Steps>
+
+## Examples
+
+```bash
+# Audit with default npm package manager
+scalp audit
+```
+
+```bash
+# Audit a pnpm project
+scalp audit --pm pnpm
+```
+
+```bash
+# Audit and block on any hash mismatch (CI usage)
+scalp audit --ci
+```
+
+```bash
+# Use a non-default policy file
+scalp audit --policy .scalp/strict-policy.json --ci
+```
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | All packages verified — no mismatches or missing entries. |
+| `1` | One or more violations found and enforcement is set to `block`. |
+
+## Files read and written
+
+| Path | Access | Description |
+|------|--------|-------------|
+| `.scalp/lockfile.json` | Read | Hash database to compare against on-disk state. |
+| `.scalp/audit.log` | Append | NDJSON audit events for every package verification result. |
+
+<Warning>
+  `scalp audit` requires `.scalp/lockfile.json` to exist. If you have not run `scalp install` or `scalp ci` yet, the command will fail with a lockfile-not-found error. Run `scalp install` first to generate the initial hash database.
+</Warning>
+
+<Note>
+  Audit does not modify `node_modules` or `.scalp/lockfile.json`. It is safe to run at any point after install to confirm the integrity of your installed packages.
+</Note>
